@@ -537,78 +537,12 @@ func (p *SNIProxy) setupUDPForward() error {
 	targetAddr := targetIP + ":" + targetPort
 	go p.proxyUDP(udpConn, targetAddr)
 
-	// Запустить TCP прокси для Supercell
-	go p.proxyTCPSupercell(targetAddr)
-
-	return nil
-}
-
-// proxyTCPSupercell проксирует TCP трафик для Supercell игр
-func (p *SNIProxy) proxyTCPSupercell(targetAddr string) {
-	// Слушаем TCP на порту 9339
-	tcpAddr, err := net.ResolveTCPAddr("tcp", ":9339")
-	if err != nil {
-		p.logger.Printf("[%s] ERROR ❌ TCP resolve: %v",
-			time.Now().Format("2006-01-02 15:04:05"), err)
-		return
-	}
-
-	tcpLn, err := net.ListenTCP("tcp", tcpAddr)
-	if err != nil {
-		p.logger.Printf("[%s] ERROR ❌ TCP listen: %v",
-			time.Now().Format("2006-01-02 15:04:05"), err)
-		return
-	}
-	defer tcpLn.Close()
-
-	p.logger.Printf("[%s] INFO 🎮 TCP Supercell listener on :9339 -> %s",
+	// TCP не слушаем - iptables сам перенаправит на target
+	// Это работает потому что iptables DNAT меняет destination IP
+	p.logger.Printf("[%s] INFO 🎮 TCP via iptables DNAT: :9339 -> %s",
 		time.Now().Format("2006-01-02 15:04:05"), targetAddr)
 
-	for {
-		select {
-		case <-p.shutdown:
-			return
-		default:
-		}
-
-		tcpLn.SetDeadline(time.Now().Add(2 * time.Second))
-		clientConn, err := tcpLn.AcceptTCP()
-		if err != nil {
-			continue
-		}
-
-		clientAddr := clientConn.RemoteAddr().String()
-		p.logger.Printf("[%s] INFO 🎮 TCP: %s -> %s",
-			time.Now().Format("2006-01-02 15:04:05"), clientAddr, targetAddr)
-
-		// Подключиться к серверу
-		serverConn, err := net.Dial("tcp", targetAddr)
-		if err != nil {
-			p.logger.Printf("[%s] ERROR ❌ TCP connect: %v",
-				time.Now().Format("2006-01-02 15:04:05"), err)
-			clientConn.Close()
-			continue
-		}
-
-		// Копировать трафик
-		go func(clientConn, serverConn *net.TCPConn) {
-			defer clientConn.Close()
-			defer serverConn.Close()
-
-			done := make(chan struct{}, 2)
-			go func() {
-				io.Copy(serverConn, clientConn)
-				done <- struct{}{}
-			}()
-			go func() {
-				io.Copy(clientConn, serverConn)
-				done <- struct{}{}
-			}()
-
-			<-done
-			<-done
-		}(clientConn, serverConn.(*net.TCPConn))
-	}
+	return nil
 }
 
 // proxyUDP проксирует UDP трафик
