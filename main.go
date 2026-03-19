@@ -408,27 +408,32 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 
 	// Настроить буферы для производительности
 	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
-		tcpConn.SetReadBuffer(256 * 1024)
-		tcpConn.SetWriteBuffer(256 * 1024)
+		tcpConn.SetReadBuffer(1024 * 1024)  // 1MB
+		tcpConn.SetWriteBuffer(1024 * 1024) // 1MB
 		tcpConn.SetNoDelay(true)
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 	if tcpConn, ok := serverConn.(*net.TCPConn); ok {
-		tcpConn.SetReadBuffer(256 * 1024)
-		tcpConn.SetWriteBuffer(256 * 1024)
+		tcpConn.SetReadBuffer(1024 * 1024)  // 1MB
+		tcpConn.SetWriteBuffer(1024 * 1024) // 1MB
 		tcpConn.SetNoDelay(true)
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 
 	// Копировать трафик в обе стороны
 	done := make(chan struct{}, 2)
 	idleTimeout := time.Duration(p.config.IdleTimeout) * time.Second
+	readTimeout := 120 * time.Second // 2 минуты на чтение
 
 	go func() {
-		copyWithTimeout(serverConn, clientConn, idleTimeout)
+		copyWithTimeout(serverConn, clientConn, idleTimeout, readTimeout)
 		done <- struct{}{}
 	}()
 
 	go func() {
-		copyWithTimeout(clientConn, serverConn, idleTimeout)
+		copyWithTimeout(clientConn, serverConn, idleTimeout, readTimeout)
 		done <- struct{}{}
 	}()
 
@@ -442,7 +447,7 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 }
 
 // copyWithTimeout копирует данные с таймаутом бездействия
-func copyWithTimeout(dst net.Conn, src net.Conn, timeout time.Duration) {
+func copyWithTimeout(dst net.Conn, src net.Conn, idleTimeout time.Duration, readTimeout time.Duration) {
 	// Отключаем Nagle's algorithm для уменьшения задержек
 	if tcpConn, ok := dst.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
@@ -451,13 +456,13 @@ func copyWithTimeout(dst net.Conn, src net.Conn, timeout time.Duration) {
 		tcpConn.SetNoDelay(true)
 	}
 
-	buf := make([]byte, 64*1024) // Увеличенный буфер
+	buf := make([]byte, 128*1024) // 128KB буфер
 	for {
-		src.SetReadDeadline(time.Now().Add(timeout))
+		src.SetReadDeadline(time.Now().Add(readTimeout))
 
 		n, err := src.Read(buf)
 		if n > 0 {
-			dst.SetWriteDeadline(time.Now().Add(timeout))
+			dst.SetWriteDeadline(time.Now().Add(idleTimeout))
 			if _, werr := dst.Write(buf[:n]); werr != nil {
 				return
 			}
