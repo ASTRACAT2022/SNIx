@@ -490,8 +490,16 @@ func (p *SNIProxy) Shutdown() {
 func main() {
 	// Загрузить конфигурацию
 	configPath := "config.json"
-	if len(os.Args) > 1 {
-		configPath = os.Args[1]
+
+	// Парсинг аргументов: поддерживаем --config и позиционный аргумент
+	for i := 1; i < len(os.Args); i++ {
+		if os.Args[i] == "--config" && i+1 < len(os.Args) {
+			configPath = os.Args[i+1]
+			break
+		} else if !strings.HasPrefix(os.Args[i], "-") {
+			configPath = os.Args[i]
+			break
+		}
 	}
 
 	config, err := LoadConfig(configPath)
