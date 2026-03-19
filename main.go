@@ -329,6 +329,7 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 	if sni == "" {
 		p.logger.Printf("[%s] WARN  ⚠️ Неизвестный SNI (пустой) от %s",
 			time.Now().Format("2006-01-02 15:04:05"), clientAddr)
+		clientConn.Close()
 		return
 	}
 
@@ -354,6 +355,7 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 		} else {
 			p.logger.Printf("[%s] WARN  ⚠️ Неизвестный SNI: %s от %s",
 				time.Now().Format("2006-01-02 15:04:05"), sni, clientAddr)
+			clientConn.Close()
 			return
 		}
 	}
@@ -363,12 +365,14 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 	if err != nil {
 		p.logger.Printf("[%s] ERROR ❌ Ошибка DNS для %s: %v",
 			time.Now().Format("2006-01-02 15:04:05"), game.Domains[0], err)
+		clientConn.Close()
 		return
 	}
 
 	if len(ips) == 0 {
 		p.logger.Printf("[%s] ERROR ❌ Нет IP-адресов для %s",
 			time.Now().Format("2006-01-02 15:04:05"), game.Domains[0])
+		clientConn.Close()
 		return
 	}
 
@@ -393,13 +397,25 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 	p.logger.Printf("[%s] INFO  ✅ %s -> %s (%s)",
 		time.Now().Format("2006-01-02 15:04:05"), clientAddr, targetAddr, sni)
 
-	// Отправить ClientHello на сервер
+	// Отправить ClientHello на сервер СРАЗУ
 	if _, err := serverConn.Write(headerBuf); err != nil {
 		p.logger.Printf("[%s] ERROR ❌ Ошибка отправки ClientHello: %v",
 			time.Now().Format("2006-01-02 15:04:05"), err)
 		clientConn.Close()
 		serverConn.Close()
 		return
+	}
+
+	// Настроить буферы для производительности
+	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
+		tcpConn.SetReadBuffer(256 * 1024)
+		tcpConn.SetWriteBuffer(256 * 1024)
+		tcpConn.SetNoDelay(true)
+	}
+	if tcpConn, ok := serverConn.(*net.TCPConn); ok {
+		tcpConn.SetReadBuffer(256 * 1024)
+		tcpConn.SetWriteBuffer(256 * 1024)
+		tcpConn.SetNoDelay(true)
 	}
 
 	// Копировать трафик в обе стороны
