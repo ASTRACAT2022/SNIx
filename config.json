@@ -1,0 +1,39 @@
+{
+  "listen_ports": [443, 9339, 30000],
+  "games": [
+    {
+      "name": "Brawl Stars",
+      "domains": ["game.brawlstarsgame.com"],
+      "port": 9339,
+      "target_port": 9339
+    },
+    {
+      "name": "Clash Royale",
+      "domains": ["game.clashroyaleapp.com"],
+      "port": 9339,
+      "target_port": 9339
+    },
+    {
+      "name": "Clash of Clans",
+      "domains": ["gamea.clashofclans.com", "game.clashofclans.com"],
+      "port": 9339,
+      "target_port": 9339
+    },
+    {
+      "name": "Squad Busters",
+      "domains": ["game.squadbustersgame.com"],
+      "port": 9339,
+      "target_port": 9339
+    },
+    {
+      "name": "mo.co",
+      "domains": ["game.mocogame.com", "api.mocogame.com"],
+      "port": 30000,
+      "target_port": 30000
+    }
+  ],
+  "log_file": "proxy.log",
+  "dns_cache_ttl": 300,
+  "connection_timeout": 10,
+  "idle_timeout": 18000
+}

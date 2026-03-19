@@ -1,0 +1,29 @@
+[Unit]
+Description=Game SNI Proxy
+Documentation=https://github.com/yourusername/game-sni-proxy
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/sni-proxy
+ExecStart=/opt/sni-proxy/sni-proxy /opt/sni-proxy/config.json
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sni-proxy
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/sni-proxy/logs
+
+[Install]
+WantedBy=multi-user.target
