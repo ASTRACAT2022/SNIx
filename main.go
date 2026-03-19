@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
@@ -33,6 +34,8 @@ type Config struct {
 	ConnectionTimeout int    `json:"connection_timeout"`
 	IdleTimeout       int    `json:"idle_timeout"`
 	AllowUnknownSNI   bool   `json:"allow_unknown_sni"`
+	UDPForwardTarget  string `json:"udp_forward_target"`
+	UDPForwardEnabled bool   `json:"udp_forward_enabled"`
 }
 
 // DNSCacheEntry представляет запись кэша DNS
@@ -90,6 +93,7 @@ type SNIProxy struct {
 	resolver   *DNSResolver
 	domainMap  map[string]*Game
 	listeners  []net.Listener
+	udpConns   []net.UDPConn
 	wg         sync.WaitGroup
 	shutdown   chan struct{}
 	logger     *log.Logger
@@ -423,6 +427,15 @@ func copyData(dst net.Conn, src net.Conn, readTimeout, idleTimeout time.Duration
 
 // Start запускает прослушивание портов
 func (p *SNIProxy) Start() error {
+	// Настроить UDP проброс если включено
+	if p.config.UDPForwardEnabled && p.config.UDPForwardTarget != "" {
+		if err := p.setupUDPForward(); err != nil {
+			p.logger.Printf("[%s] WARN ⚠️ UDP forward setup: %v",
+				time.Now().Format("2006-01-02 15:04:05"), err)
+		}
+	}
+
+	// TCP слушатели
 	for _, port := range p.config.ListenPorts {
 		addr := fmt.Sprintf(":%d", port)
 		ln, err := net.Listen("tcp", addr)
@@ -467,6 +480,125 @@ func (p *SNIProxy) Start() error {
 	return nil
 }
 
+// setupUDPForward настраивает UDP проброс для игр
+func (p *SNIProxy) setupUDPForward() error {
+	// Распарсить target
+	targetParts := strings.Split(p.config.UDPForwardTarget, ":")
+	if len(targetParts) != 2 {
+		return fmt.Errorf("некорректный UDP target: %s", p.config.UDPForwardTarget)
+	}
+	targetIP := targetParts[0]
+	targetPort := targetParts[1]
+
+	// Найти IP через DNS для Supercell
+	ips, err := p.resolver.Resolve("game.brawlstarsgame.com")
+	if err == nil && len(ips) > 0 {
+		targetIP = ips[0].String()
+		p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:9339 (Brawl Stars)",
+			time.Now().Format("2006-01-02 15:04:05"), targetIP)
+	} else {
+		p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:9339",
+			time.Now().Format("2006-01-02 15:04:05"), targetIP)
+	}
+
+	// Настроить iptables
+	commands := []string{
+		// Включить IP forwarding
+		"echo 1 > /proc/sys/net/ipv4/ip_forward",
+		// Разрешить UDP на порту 9339
+		"iptables -t nat -C PREROUTING -p udp --dport 9339 -j DNAT --to-destination " + targetIP + ":" + targetPort + " 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport 9339 -j DNAT --to-destination " + targetIP + ":" + targetPort,
+		// Разрешить FORWARD
+		"iptables -C FORWARD -p udp --dport 9339 -j ACCEPT 2>/dev/null || iptables -A FORWARD -p udp --dport 9339 -j ACCEPT",
+	}
+
+	for _, cmd := range commands {
+		if strings.HasPrefix(cmd, "echo") {
+			exec.Command("sh", "-c", cmd).Run()
+		} else {
+			exec.Command("sh", "-c", cmd).Run()
+		}
+	}
+
+	// Запустить UDP прокси
+	udpAddr, err := net.ResolveUDPAddr("udp", ":9339")
+	if err != nil {
+		return err
+	}
+
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return fmt.Errorf("UDP listen: %w", err)
+	}
+
+	p.udpConns = append(p.udpConns, *udpConn)
+	p.logger.Printf("[%s] INFO 🎮 UDP listener on :9339",
+		time.Now().Format("2006-01-02 15:04:05"))
+
+	// Проксирование UDP
+	targetAddr := targetIP + ":" + targetPort
+	go p.proxyUDP(udpConn, targetAddr)
+
+	return nil
+}
+
+// proxyUDP проксирует UDP трафик
+func (p *SNIProxy) proxyUDP(udpConn *net.UDPConn, targetAddr string) {
+	clientMap := make(map[string]*net.UDPConn)
+	var mu sync.Mutex
+
+	buf := make([]byte, 65535)
+	for {
+		select {
+		case <-p.shutdown:
+			return
+		default:
+		}
+
+		udpConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, clientAddr, err := udpConn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+
+		mu.Lock()
+		serverConn, exists := clientMap[clientAddr.String()]
+		if !exists {
+			// Создать новое соединение с сервером
+			serverAddr, _ := net.ResolveUDPAddr("udp", targetAddr)
+			serverConn, err = net.DialUDP("udp", nil, serverAddr)
+			if err != nil {
+				mu.Unlock()
+				continue
+			}
+			clientMap[clientAddr.String()] = serverConn
+
+			// Запустить чтение от сервера
+			go func(clientAddr *net.UDPAddr, serverConn *net.UDPConn) {
+				defer func() {
+					mu.Lock()
+					delete(clientMap, clientAddr.String())
+					serverConn.Close()
+					mu.Unlock()
+				}()
+
+				buf := make([]byte, 65535)
+				for {
+					serverConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+					n, _, err := serverConn.ReadFromUDP(buf)
+					if err != nil {
+						return
+					}
+					udpConn.WriteToUDP(buf[:n], clientAddr)
+				}
+			}(clientAddr, serverConn)
+		}
+		mu.Unlock()
+
+		// Отправить на сервер
+		serverConn.Write(buf[:n])
+	}
+}
+
 // Shutdown корректная остановка
 func (p *SNIProxy) Shutdown() {
 	p.logger.Printf("[%s] INFO 🛑 Shutdown...",
@@ -476,6 +608,11 @@ func (p *SNIProxy) Shutdown() {
 
 	for _, ln := range p.listeners {
 		ln.Close()
+	}
+
+	// Закрыть UDP соединения
+	for _, conn := range p.udpConns {
+		conn.Close()
 	}
 
 	done := make(chan struct{})

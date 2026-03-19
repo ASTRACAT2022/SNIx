@@ -20,7 +20,8 @@
         "store.supercell.com"
       ],
       "port": 9339,
-      "target_port": 9339
+      "target_port": 9339,
+      "target_ip": "18.196.54.123"
     },
     {
       "name": "ChatGPT / OpenAI",
@@ -421,5 +422,7 @@
   "dns_cache_ttl": 600,
   "connection_timeout": 30,
   "idle_timeout": 3600,
-  "allow_unknown_sni": true
+  "allow_unknown_sni": true,
+  "udp_forward_enabled": true,
+  "udp_forward_target": "18.196.54.123:9339"
 }
