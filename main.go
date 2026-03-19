@@ -113,10 +113,10 @@ func LoadConfig(path string) (*Config, error) {
 		config.DNSCacheTTL = 300
 	}
 	if config.ConnectionTimeout == 0 {
-		config.ConnectionTimeout = 10
+		config.ConnectionTimeout = 30
 	}
 	if config.IdleTimeout == 0 {
-		config.IdleTimeout = 18000
+		config.IdleTimeout = 3600
 	}
 
 	return &config, nil
@@ -143,7 +143,6 @@ func NewSNIProxy(config *Config) (*SNIProxy, error) {
 	// Настроить логирование
 	var logWriter io.Writer = os.Stdout
 	if config.LogFile != "" {
-		// Создать директорию для логов если не существует
 		if err := os.MkdirAll("logs", 0755); err != nil {
 			log.Printf("Предупреждение: не удалось создать директорию logs: %v", err)
 		}
@@ -167,16 +166,9 @@ func NewSNIProxy(config *Config) (*SNIProxy, error) {
 	return proxy, nil
 }
 
-// extractSNI извлекает SNI из TLS ClientHello
-func extractSNI(conn net.Conn) (string, error) {
-	sni, _, err := extractSNIWithBuffer(conn)
-	return sni, err
-}
-
-// extractSNIWithBuffer извлекает SNI и возвращает буфер с ClientHello
+// extractSNIWithBuffer извлекает SNI и возвращает ВСЕ прочитанные данные
 func extractSNIWithBuffer(conn net.Conn) (string, []byte, error) {
-	// Установить таймаут чтения
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
 	// Читать первые 5 байт (заголовок TLS)
 	header := make([]byte, 5)
@@ -184,82 +176,64 @@ func extractSNIWithBuffer(conn net.Conn) (string, []byte, error) {
 		return "", nil, fmt.Errorf("ошибка чтения заголовка TLS: %w", err)
 	}
 
-	// Проверить тип записи (Content Type = 0x16 для Handshake)
+	// Проверить тип записи (0x16 = Handshake)
 	if header[0] != 0x16 {
 		return "", nil, fmt.Errorf("не TLS handshake: type=%d", header[0])
 	}
 
-	// Проверить версию TLS
-	version := binary.BigEndian.Uint16(header[1:3])
-	if version < 0x0301 || version > 0x0304 {
-		return "", nil, fmt.Errorf("неподдерживаемая версия TLS: 0x%04x", version)
-	}
-
 	// Получить длину записи
 	length := int(binary.BigEndian.Uint16(header[3:5]))
-	if length > 65535 {
-		return "", nil, fmt.Errorf("слишком большая запись: %d", length)
+	if length > 65535 || length < 100 {
+		return "", nil, fmt.Errorf("некорректная длина записи: %d", length)
 	}
 
-	// Читать всю запись Handshake
+	// Читать ВСЁ сообщение handshake
 	handshake := make([]byte, length)
 	if _, err := io.ReadFull(conn, handshake); err != nil {
 		return "", nil, fmt.Errorf("ошибка чтения handshake: %w", err)
 	}
 
-	// Собрать полный буфер (header + handshake)
+	// Собрать полный буфер
 	fullBuf := append(header, handshake...)
 
-	// Пропустить тип handshake (1 байт) и длину (3 байта)
-	if len(handshake) < 4 {
-		return "", fullBuf, fmt.Errorf("слишком короткий handshake")
+	// Парсить SNI из handshake
+	sni := parseSNI(handshake)
+
+	return sni, fullBuf, nil
+}
+
+// parseSNI извлекает SNI из TLS handshake сообщения
+func parseSNI(handshake []byte) string {
+	if len(handshake) < 77 {
+		return ""
 	}
 
-	// Пропустить версию TLS и random (2 + 32 байта)
-	if len(handshake) < 38 {
-		return "", fullBuf, fmt.Errorf("слишком короткий handshake для версии/random")
-	}
-
-	// Пропустить session ID (1 байт длина + сама сессия)
+	// Пропустить: type(1) + length(3) + version(2) + random(32) + session_id_len(1)
 	sessionIDLen := int(handshake[38])
 	offset := 39 + sessionIDLen
-	if offset > len(handshake) {
-		return "", fullBuf, fmt.Errorf("некорректная длина session ID")
+	if offset+2 > len(handshake) {
+		return ""
 	}
 
-	// Пропустить cipher suites (2 байта длина + сами шифры)
-	if offset+2 > len(handshake) {
-		return "", fullBuf, fmt.Errorf("некорректная длина cipher suites")
-	}
+	// Cipher suites
 	cipherSuiteLen := int(binary.BigEndian.Uint16(handshake[offset : offset+2]))
 	offset += 2 + cipherSuiteLen
-	if offset > len(handshake) {
-		return "", fullBuf, fmt.Errorf("некорректная длина cipher suites")
+	if offset+1 > len(handshake) {
+		return ""
 	}
 
-	// Пропустить compression methods (1 байт длина + методы)
-	if offset+1 > len(handshake) {
-		return "", fullBuf, fmt.Errorf("некорректная длина compression methods")
-	}
+	// Compression methods
 	compressionLen := int(handshake[offset])
 	offset += 1 + compressionLen
-	if offset > len(handshake) {
-		return "", fullBuf, fmt.Errorf("некорректная длина compression methods")
+	if offset+2 > len(handshake) {
+		return ""
 	}
 
-	// Проверить наличие extensions
-	if offset+2 > len(handshake) {
-		return "", fullBuf, nil // Нет extensions
-	}
+	// Extensions
 	extensionsLen := int(binary.BigEndian.Uint16(handshake[offset : offset+2]))
 	offset += 2
-
-	if offset+extensionsLen > len(handshake) {
-		return "", fullBuf, fmt.Errorf("некорректная длина extensions")
-	}
-
-	// Парсить extensions
 	extensionsEnd := offset + extensionsLen
+
 	for offset+4 <= extensionsEnd {
 		extType := binary.BigEndian.Uint16(handshake[offset : offset+2])
 		extLen := int(binary.BigEndian.Uint16(handshake[offset+2 : offset+4]))
@@ -271,39 +245,34 @@ func extractSNIWithBuffer(conn net.Conn) (string, []byte, error) {
 
 		// Extension type 0 = SNI
 		if extType == 0 && extLen >= 5 {
-			// Пропустить длину списка SNI (2 байта) и тип (1 байт)
-			// Получить длину домена (2 байта)
 			nameLen := int(binary.BigEndian.Uint16(handshake[offset+3 : offset+5]))
 			if offset+5+nameLen <= extensionsEnd {
-				sni := string(handshake[offset+5 : offset+5+nameLen])
-				return sni, fullBuf, nil
+				return string(handshake[offset+5 : offset+5+nameLen])
 			}
 		}
 
 		offset += extLen
 	}
 
-	return "", fullBuf, nil
+	return ""
 }
 
 // findGameBySNI находит игру по SNI
 func (p *SNIProxy) findGameBySNI(sni string, port int) *Game {
 	sni = strings.ToLower(sni)
 
-	// Точное совпадение
 	if game, ok := p.domainMap[sni]; ok {
 		if game.Port == port {
 			return game
 		}
 	}
 
-	//Wildcard matching (например, *.example.com)
 	for domain, game := range p.domainMap {
 		if game.Port != port {
 			continue
 		}
 		if strings.HasPrefix(domain, "*.") {
-			suffix := domain[1:] // .example.com
+			suffix := domain[1:]
 			if strings.HasSuffix(sni, suffix) {
 				return game
 			}
@@ -316,170 +285,138 @@ func (p *SNIProxy) findGameBySNI(sni string, port int) *Game {
 // handleConnection обрабатывает подключение клиента
 func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 	clientAddr := clientConn.RemoteAddr().String()
+	defer clientConn.Close()
 
-	// Извлечь SNI (читаем первые байты)
+	// Извлечь SNI
 	sni, headerBuf, err := extractSNIWithBuffer(clientConn)
 	if err != nil {
-		p.logger.Printf("[%s] WARN  ⚠️ Ошибка извлечения SNI от %s: %v",
+		p.logger.Printf("[%s] WARN ⚠️ Ошибка SNI от %s: %v",
 			time.Now().Format("2006-01-02 15:04:05"), clientAddr, err)
-		clientConn.Close()
 		return
 	}
 
 	if sni == "" {
-		p.logger.Printf("[%s] WARN  ⚠️ Неизвестный SNI (пустой) от %s",
+		p.logger.Printf("[%s] WARN ⚠️ Пустой SNI от %s",
 			time.Now().Format("2006-01-02 15:04:05"), clientAddr)
-		clientConn.Close()
 		return
 	}
 
-	// Найти игру по SNI
+	// Найти целевой домен
 	game := p.findGameBySNI(sni, listenPort)
+	targetDomain := sni
+	targetPort := 443
 
-	// Если не найдено в конфиге и разрешено проксирование неизвестных
-	if game == nil {
-		if p.config.AllowUnknownSNI {
-			// Проксировать на тот же домен, порт 443 для HTTPS
-			targetPort := listenPort
-			if listenPort == 9339 || listenPort == 30000 {
-				targetPort = 443 // Игровые порты мапим на 443
-			}
-			game = &Game{
-				Name:       "Unknown (auto-proxy)",
-				Domains:    []string{sni},
-				Port:       listenPort,
-				TargetPort: targetPort,
-			}
-			p.logger.Printf("[%s] INFO  🔄 Auto-proxy: %s от %s (порт %d)",
-				time.Now().Format("2006-01-02 15:04:05"), sni, clientAddr, targetPort)
-		} else {
-			p.logger.Printf("[%s] WARN  ⚠️ Неизвестный SNI: %s от %s",
-				time.Now().Format("2006-01-02 15:04:05"), sni, clientAddr)
-			clientConn.Close()
-			return
+	if game != nil {
+		targetDomain = game.Domains[0]
+		if game.TargetPort > 0 {
+			targetPort = game.TargetPort
 		}
+	} else if p.config.AllowUnknownSNI {
+		p.logger.Printf("[%s] INFO 🔄 Auto-proxy: %s от %s",
+			time.Now().Format("2006-01-02 15:04:05"), sni, clientAddr)
+	} else {
+		p.logger.Printf("[%s] WARN ⚠️ Неизвестный SNI: %s от %s",
+			time.Now().Format("2006-01-02 15:04:05"), sni, clientAddr)
+		return
 	}
 
-	// Резолвить DNS
-	ips, err := p.resolver.Resolve(game.Domains[0])
+	// DNS резолвинг
+	ips, err := p.resolver.Resolve(targetDomain)
 	if err != nil {
-		p.logger.Printf("[%s] ERROR ❌ Ошибка DNS для %s: %v",
-			time.Now().Format("2006-01-02 15:04:05"), game.Domains[0], err)
-		clientConn.Close()
+		p.logger.Printf("[%s] ERROR ❌ DNS ошибка для %s: %v",
+			time.Now().Format("2006-01-02 15:04:05"), targetDomain, err)
 		return
 	}
 
 	if len(ips) == 0 {
-		p.logger.Printf("[%s] ERROR ❌ Нет IP-адресов для %s",
-			time.Now().Format("2006-01-02 15:04:05"), game.Domains[0])
-		clientConn.Close()
+		p.logger.Printf("[%s] ERROR ❌ Нет IP для %s",
+			time.Now().Format("2006-01-02 15:04:05"), targetDomain)
 		return
 	}
 
-	// Выбрать первый IP (можно улучшить с балансировкой)
+	// Подключение к серверу
 	targetIP := ips[0]
-	targetPort := game.TargetPort
 	targetAddr := fmt.Sprintf("%s:%d", targetIP.String(), targetPort)
 
-	// Подключиться к целевому серверу
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.config.ConnectionTimeout)*time.Second)
 	defer cancel()
 
 	var dialer net.Dialer
 	serverConn, err := dialer.DialContext(ctx, "tcp", targetAddr)
 	if err != nil {
-		p.logger.Printf("[%s] ERROR ❌ Ошибка подключения к %s: %v",
+		p.logger.Printf("[%s] ERROR ❌ Подключение к %s: %v",
 			time.Now().Format("2006-01-02 15:04:05"), targetAddr, err)
-		clientConn.Close()
 		return
 	}
+	defer serverConn.Close()
 
-	p.logger.Printf("[%s] INFO  ✅ %s -> %s (%s)",
+	p.logger.Printf("[%s] INFO ✅ %s -> %s (%s)",
 		time.Now().Format("2006-01-02 15:04:05"), clientAddr, targetAddr, sni)
 
-	// Отправить ClientHello на сервер СРАЗУ
-	p.logger.Printf("[%s] DEBUG 🔍 Sending %d bytes ClientHello to %s",
-		time.Now().Format("2006-01-02 15:04:05"), len(headerBuf), targetAddr)
-	
+	// Отправить ClientHello
 	if _, err := serverConn.Write(headerBuf); err != nil {
-		p.logger.Printf("[%s] ERROR ❌ Ошибка отправки ClientHello: %v",
-			time.Now().Format("2006-01-02 15:04:05"), err)
-		clientConn.Close()
-		serverConn.Close()
+		p.logger.Printf("[%s] ERROR ❌ Отправка ClientHello: %v", err)
 		return
 	}
-	
-	p.logger.Printf("[%s] DEBUG ✅ ClientHello sent successfully",
-		time.Now().Format("2006-01-02 15:04:05"))
 
-	// Настроить буферы для производительности
+	// Настроить соединения
 	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
-		tcpConn.SetReadBuffer(1024 * 1024)  // 1MB
-		tcpConn.SetWriteBuffer(1024 * 1024) // 1MB
+		tcpConn.SetReadBuffer(1024 * 1024)
+		tcpConn.SetWriteBuffer(1024 * 1024)
 		tcpConn.SetNoDelay(true)
 		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		tcpConn.SetKeepAlivePeriod(60 * time.Second)
 	}
 	if tcpConn, ok := serverConn.(*net.TCPConn); ok {
-		tcpConn.SetReadBuffer(1024 * 1024)  // 1MB
-		tcpConn.SetWriteBuffer(1024 * 1024) // 1MB
+		tcpConn.SetReadBuffer(1024 * 1024)
+		tcpConn.SetWriteBuffer(1024 * 1024)
 		tcpConn.SetNoDelay(true)
 		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		tcpConn.SetKeepAlivePeriod(60 * time.Second)
 	}
 
-	// Копировать трафик в обе стороны
+	// Копировать трафик
 	done := make(chan int64, 2)
+	readTimeout := 300 * time.Second // 5 минут
 	idleTimeout := time.Duration(p.config.IdleTimeout) * time.Second
-	readTimeout := 120 * time.Second // 2 минуты на чтение
 
 	go func() {
-		bytes := copyWithTimeout(serverConn, clientConn, idleTimeout, readTimeout)
+		bytes := copyData(serverConn, clientConn, readTimeout, idleTimeout)
 		done <- bytes
 	}()
 
 	go func() {
-		bytes := copyWithTimeout(clientConn, serverConn, idleTimeout, readTimeout)
+		bytes := copyData(clientConn, serverConn, readTimeout, idleTimeout)
 		done <- bytes
 	}()
 
-	// Ждать завершения обоих направлений
+	// Ждать оба направления
 	bytes1 := <-done
 	bytes2 := <-done
-	
-	p.logger.Printf("[%s] INFO  📊 Traffic: client→server=%d bytes, server→client=%d bytes",
-		time.Now().Format("2006-01-02 15:04:05"), bytes1, bytes2)
 
-	// Закрыть соединения
-	clientConn.Close()
-	serverConn.Close()
+	p.logger.Printf("[%s] INFO 📊 Трафик: c→s=%d байт, s→c=%d байт",
+		time.Now().Format("2006-01-02 15:04:05"), bytes1, bytes2)
 }
 
-// copyWithTimeout копирует данные с таймаутом бездействия
-func copyWithTimeout(dst net.Conn, src net.Conn, idleTimeout time.Duration, readTimeout time.Duration) int64 {
-	// Отключаем Nagle's algorithm для уменьшения задержек
-	if tcpConn, ok := dst.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
-	}
-	if tcpConn, ok := src.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
-	}
+// copyData копирует данные между соединениями
+func copyData(dst net.Conn, src net.Conn, readTimeout, idleTimeout time.Duration) int64 {
+	var total int64 = 0
+	buf := make([]byte, 256*1024) // 256KB буфер
 
-	var totalBytes int64 = 0
-	buf := make([]byte, 128*1024) // 128KB буфер
 	for {
 		src.SetReadDeadline(time.Now().Add(readTimeout))
-
 		n, err := src.Read(buf)
+
 		if n > 0 {
-			totalBytes += int64(n)
+			total += int64(n)
 			dst.SetWriteDeadline(time.Now().Add(idleTimeout))
 			if _, werr := dst.Write(buf[:n]); werr != nil {
-				return totalBytes
+				return total
 			}
 		}
+
 		if err != nil {
-			return totalBytes
+			return total
 		}
 	}
 }
@@ -490,11 +427,11 @@ func (p *SNIProxy) Start() error {
 		addr := fmt.Sprintf(":%d", port)
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
-			return fmt.Errorf("ошибка прослушивания порта %d: %w", port, err)
+			return fmt.Errorf("ошибка порта %d: %w", port, err)
 		}
 
 		p.listeners = append(p.listeners, ln)
-		p.logger.Printf("[%s] INFO  🚀 Listening on port %d",
+		p.logger.Printf("[%s] INFO 🚀 Listening on port %d",
 			time.Now().Format("2006-01-02 15:04:05"), port)
 
 		p.wg.Add(1)
@@ -513,8 +450,6 @@ func (p *SNIProxy) Start() error {
 						case <-p.shutdown:
 							return
 						default:
-							p.logger.Printf("[%s] ERROR ❌ Ошибка Accept на порту %d: %v",
-								time.Now().Format("2006-01-02 15:04:05"), port, err)
 							continue
 						}
 					}
@@ -532,19 +467,17 @@ func (p *SNIProxy) Start() error {
 	return nil
 }
 
-// Shutdown выполняет корректную остановку
+// Shutdown корректная остановка
 func (p *SNIProxy) Shutdown() {
-	p.logger.Printf("[%s] INFO  🛑 Graceful shutdown initiated...",
+	p.logger.Printf("[%s] INFO 🛑 Shutdown...",
 		time.Now().Format("2006-01-02 15:04:05"))
 
 	close(p.shutdown)
 
-	// Закрыть все слушатели
 	for _, ln := range p.listeners {
 		ln.Close()
 	}
 
-	// Ждать завершения всех подключений (с таймаутом)
 	done := make(chan struct{})
 	go func() {
 		p.wg.Wait()
@@ -553,10 +486,10 @@ func (p *SNIProxy) Shutdown() {
 
 	select {
 	case <-done:
-		p.logger.Printf("[%s] INFO  ✅ Все подключения закрыты",
+		p.logger.Printf("[%s] INFO ✅ All connections closed",
 			time.Now().Format("2006-01-02 15:04:05"))
 	case <-time.After(30 * time.Second):
-		p.logger.Printf("[%s] WARN  ⚠️ Таймаут ожидания завершения подключений",
+		p.logger.Printf("[%s] WARN ⚠️ Shutdown timeout",
 			time.Now().Format("2006-01-02 15:04:05"))
 	}
 
@@ -566,16 +499,13 @@ func (p *SNIProxy) Shutdown() {
 }
 
 func main() {
-	// Загрузить конфигурацию
 	configPath := "config.json"
-
-	// Парсинг аргументов: поддерживаем --config и позиционный аргумент
+	if len(os.Args) > 1 && os.Args[1] != "--config" {
+		configPath = os.Args[1]
+	}
 	for i := 1; i < len(os.Args); i++ {
 		if os.Args[i] == "--config" && i+1 < len(os.Args) {
 			configPath = os.Args[i+1]
-			break
-		} else if !strings.HasPrefix(os.Args[i], "-") {
-			configPath = os.Args[i]
 			break
 		}
 	}
@@ -585,21 +515,18 @@ func main() {
 		log.Fatalf("[%s] ERROR ❌ %v", time.Now().Format("2006-01-02 15:04:05"), err)
 	}
 
-	// Создать прокси
 	proxy, err := NewSNIProxy(config)
 	if err != nil {
 		log.Fatalf("[%s] ERROR ❌ %v", time.Now().Format("2006-01-02 15:04:05"), err)
 	}
 
-	// Запустить
 	if err := proxy.Start(); err != nil {
 		log.Fatalf("[%s] ERROR ❌ %v", time.Now().Format("2006-01-02 15:04:05"), err)
 	}
 
-	// Обработка сигналов
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
 	<-sigChan
+
 	proxy.Shutdown()
 }
