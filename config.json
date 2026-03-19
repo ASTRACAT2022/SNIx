@@ -41,7 +41,9 @@
         "sora.chatgpt.com",
         "sora.com",
         "videos.openai.com",
-        "ios.chat.openai.com"
+        "ios.chat.openai.com",
+        "chat.openai.com",
+        "cdn.openai.com"
       ],
       "port": 443,
       "target_port": 443
@@ -95,7 +97,8 @@
         "accounts.scdn.co",
         "gew1-dealer.spotify.com",
         "open-exp.spotifycdn.com",
-        "www-growth.scdn.co"
+        "www-growth.scdn.co",
+        "i.scdn.co"
       ],
       "port": 443,
       "target_port": 443
@@ -366,7 +369,9 @@
         "www.dyson.fr",
         "profile.broadcom.com",
         "patreon.com",
-        "www.patreon.com"
+        "www.patreon.com",
+        "analiti.com",
+        "shop.playboicarti.com"
       ],
       "port": 443,
       "target_port": 443
