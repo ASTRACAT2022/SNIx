@@ -32,6 +32,7 @@ type Config struct {
 	DNSCacheTTL       int    `json:"dns_cache_ttl"`
 	ConnectionTimeout int    `json:"connection_timeout"`
 	IdleTimeout       int    `json:"idle_timeout"`
+	AllowUnknownSNI   bool   `json:"allow_unknown_sni"`
 }
 
 // DNSCacheEntry представляет запись кэша DNS
@@ -334,10 +335,24 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 
 	// Найти игру по SNI
 	game := p.findGameBySNI(sni, listenPort)
+	
+	// Если не найдено в конфиге и разрешено проксирование неизвестных
 	if game == nil {
-		p.logger.Printf("[%s] WARN  ⚠️ Неизвестный SNI: %s от %s",
-			time.Now().Format("2006-01-02 15:04:05"), sni, clientAddr)
-		return
+		if p.config.AllowUnknownSNI {
+			// Проксировать на тот же домен
+			game = &Game{
+				Name:       "Unknown (auto-proxy)",
+				Domains:    []string{sni},
+				Port:       listenPort,
+				TargetPort: listenPort,
+			}
+			p.logger.Printf("[%s] INFO  🔄 Auto-proxy: %s от %s",
+				time.Now().Format("2006-01-02 15:04:05"), sni, clientAddr)
+		} else {
+			p.logger.Printf("[%s] WARN  ⚠️ Неизвестный SNI: %s от %s",
+				time.Now().Format("2006-01-02 15:04:05"), sni, clientAddr)
+			return
+		}
 	}
 
 	// Резолвить DNS

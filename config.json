@@ -420,5 +420,6 @@
   "log_file": "proxy.log",
   "dns_cache_ttl": 300,
   "connection_timeout": 10,
-  "idle_timeout": 18000
+  "idle_timeout": 18000,
+  "allow_unknown_sni": true
 }
