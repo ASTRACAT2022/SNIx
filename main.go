@@ -398,6 +398,9 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 		time.Now().Format("2006-01-02 15:04:05"), clientAddr, targetAddr, sni)
 
 	// Отправить ClientHello на сервер СРАЗУ
+	p.logger.Printf("[%s] DEBUG 🔍 Sending %d bytes ClientHello to %s",
+		time.Now().Format("2006-01-02 15:04:05"), len(headerBuf), targetAddr)
+	
 	if _, err := serverConn.Write(headerBuf); err != nil {
 		p.logger.Printf("[%s] ERROR ❌ Ошибка отправки ClientHello: %v",
 			time.Now().Format("2006-01-02 15:04:05"), err)
@@ -405,6 +408,9 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 		serverConn.Close()
 		return
 	}
+	
+	p.logger.Printf("[%s] DEBUG ✅ ClientHello sent successfully",
+		time.Now().Format("2006-01-02 15:04:05"))
 
 	// Настроить буферы для производительности
 	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
@@ -423,31 +429,34 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 	}
 
 	// Копировать трафик в обе стороны
-	done := make(chan struct{}, 2)
+	done := make(chan int64, 2)
 	idleTimeout := time.Duration(p.config.IdleTimeout) * time.Second
 	readTimeout := 120 * time.Second // 2 минуты на чтение
 
 	go func() {
-		copyWithTimeout(serverConn, clientConn, idleTimeout, readTimeout)
-		done <- struct{}{}
+		bytes := copyWithTimeout(serverConn, clientConn, idleTimeout, readTimeout)
+		done <- bytes
 	}()
 
 	go func() {
-		copyWithTimeout(clientConn, serverConn, idleTimeout, readTimeout)
-		done <- struct{}{}
+		bytes := copyWithTimeout(clientConn, serverConn, idleTimeout, readTimeout)
+		done <- bytes
 	}()
 
 	// Ждать завершения обоих направлений
-	<-done
-	<-done
+	bytes1 := <-done
+	bytes2 := <-done
 	
+	p.logger.Printf("[%s] INFO  📊 Traffic: client→server=%d bytes, server→client=%d bytes",
+		time.Now().Format("2006-01-02 15:04:05"), bytes1, bytes2)
+
 	// Закрыть соединения
 	clientConn.Close()
 	serverConn.Close()
 }
 
 // copyWithTimeout копирует данные с таймаутом бездействия
-func copyWithTimeout(dst net.Conn, src net.Conn, idleTimeout time.Duration, readTimeout time.Duration) {
+func copyWithTimeout(dst net.Conn, src net.Conn, idleTimeout time.Duration, readTimeout time.Duration) int64 {
 	// Отключаем Nagle's algorithm для уменьшения задержек
 	if tcpConn, ok := dst.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
@@ -456,19 +465,21 @@ func copyWithTimeout(dst net.Conn, src net.Conn, idleTimeout time.Duration, read
 		tcpConn.SetNoDelay(true)
 	}
 
+	var totalBytes int64 = 0
 	buf := make([]byte, 128*1024) // 128KB буфер
 	for {
 		src.SetReadDeadline(time.Now().Add(readTimeout))
 
 		n, err := src.Read(buf)
 		if n > 0 {
+			totalBytes += int64(n)
 			dst.SetWriteDeadline(time.Now().Add(idleTimeout))
 			if _, werr := dst.Write(buf[:n]); werr != nil {
-				return
+				return totalBytes
 			}
 		}
 		if err != nil {
-			return
+			return totalBytes
 		}
 	}
 }
