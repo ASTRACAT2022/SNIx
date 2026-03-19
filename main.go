@@ -315,8 +315,6 @@ func (p *SNIProxy) findGameBySNI(sni string, port int) *Game {
 
 // handleConnection обрабатывает подключение клиента
 func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
-	defer clientConn.Close()
-
 	clientAddr := clientConn.RemoteAddr().String()
 
 	// Извлечь SNI (читаем первые байты)
@@ -324,6 +322,7 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 	if err != nil {
 		p.logger.Printf("[%s] WARN  ⚠️ Ошибка извлечения SNI от %s: %v",
 			time.Now().Format("2006-01-02 15:04:05"), clientAddr, err)
+		clientConn.Close()
 		return
 	}
 
@@ -387,9 +386,9 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 	if err != nil {
 		p.logger.Printf("[%s] ERROR ❌ Ошибка подключения к %s: %v",
 			time.Now().Format("2006-01-02 15:04:05"), targetAddr, err)
+		clientConn.Close()
 		return
 	}
-	defer serverConn.Close()
 
 	p.logger.Printf("[%s] INFO  ✅ %s -> %s (%s)",
 		time.Now().Format("2006-01-02 15:04:05"), clientAddr, targetAddr, sni)
@@ -398,6 +397,8 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 	if _, err := serverConn.Write(headerBuf); err != nil {
 		p.logger.Printf("[%s] ERROR ❌ Ошибка отправки ClientHello: %v",
 			time.Now().Format("2006-01-02 15:04:05"), err)
+		clientConn.Close()
+		serverConn.Close()
 		return
 	}
 
@@ -418,20 +419,14 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 	// Ждать завершения обоих направлений
 	<-done
 	<-done
+	
+	// Закрыть соединения
+	clientConn.Close()
+	serverConn.Close()
 }
 
 // copyWithTimeout копирует данные с таймаутом бездействия
 func copyWithTimeout(dst net.Conn, src net.Conn, timeout time.Duration) {
-	defer func() {
-		// Закрываем обе стороны при завершении копирования
-		if tcpConn, ok := src.(*net.TCPConn); ok {
-			tcpConn.CloseRead()
-		}
-		if tcpConn, ok := dst.(*net.TCPConn); ok {
-			tcpConn.CloseWrite()
-		}
-	}()
-
 	// Отключаем Nagle's algorithm для уменьшения задержек
 	if tcpConn, ok := dst.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
