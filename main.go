@@ -402,30 +402,36 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 	}
 
 	// Копировать трафик в обе стороны
-	errChan := make(chan error, 2)
+	done := make(chan struct{}, 2)
 	idleTimeout := time.Duration(p.config.IdleTimeout) * time.Second
 
 	go func() {
-		errChan <- copyWithTimeout(serverConn, clientConn, idleTimeout)
+		copyWithTimeout(serverConn, clientConn, idleTimeout)
+		done <- struct{}{}
 	}()
 
 	go func() {
-		errChan <- copyWithTimeout(clientConn, serverConn, idleTimeout)
+		copyWithTimeout(clientConn, serverConn, idleTimeout)
+		done <- struct{}{}
 	}()
 
-	// Ждать ошибку из любого направления
-	<-errChan
-	
-	// Закрыть соединения
-	clientConn.Close()
-	serverConn.Close()
-	
-	// Ждать второе направление
-	<-errChan
+	// Ждать завершения обоих направлений
+	<-done
+	<-done
 }
 
 // copyWithTimeout копирует данные с таймаутом бездействия
-func copyWithTimeout(dst net.Conn, src net.Conn, timeout time.Duration) error {
+func copyWithTimeout(dst net.Conn, src net.Conn, timeout time.Duration) {
+	defer func() {
+		// Закрываем обе стороны при завершении копирования
+		if tcpConn, ok := src.(*net.TCPConn); ok {
+			tcpConn.CloseRead()
+		}
+		if tcpConn, ok := dst.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		}
+	}()
+
 	// Отключаем Nagle's algorithm для уменьшения задержек
 	if tcpConn, ok := dst.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
@@ -442,14 +448,11 @@ func copyWithTimeout(dst net.Conn, src net.Conn, timeout time.Duration) error {
 		if n > 0 {
 			dst.SetWriteDeadline(time.Now().Add(timeout))
 			if _, werr := dst.Write(buf[:n]); werr != nil {
-				return fmt.Errorf("ошибка записи: %w", werr)
+				return
 			}
 		}
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				return nil // Нормальный таймаут бездействия
-			}
-			return err
+			return
 		}
 	}
 }
