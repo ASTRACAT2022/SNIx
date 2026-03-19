@@ -501,22 +501,21 @@ func (p *SNIProxy) setupUDPForward() error {
 			time.Now().Format("2006-01-02 15:04:05"), targetIP)
 	}
 
-	// Настроить iptables
+	// Настроить iptables для UDP
 	commands := []string{
 		// Включить IP forwarding
 		"echo 1 > /proc/sys/net/ipv4/ip_forward",
-		// Разрешить UDP на порту 9339
+		// UDP DNAT
 		"iptables -t nat -C PREROUTING -p udp --dport 9339 -j DNAT --to-destination " + targetIP + ":" + targetPort + " 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport 9339 -j DNAT --to-destination " + targetIP + ":" + targetPort,
+		// TCP DNAT (для Supercell)
+		"iptables -t nat -C PREROUTING -p tcp --dport 9339 -j DNAT --to-destination " + targetIP + ":" + targetPort + " 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport 9339 -j DNAT --to-destination " + targetIP + ":" + targetPort,
 		// Разрешить FORWARD
 		"iptables -C FORWARD -p udp --dport 9339 -j ACCEPT 2>/dev/null || iptables -A FORWARD -p udp --dport 9339 -j ACCEPT",
+		"iptables -C FORWARD -p tcp --dport 9339 -j ACCEPT 2>/dev/null || iptables -A FORWARD -p tcp --dport 9339 -j ACCEPT",
 	}
 
 	for _, cmd := range commands {
-		if strings.HasPrefix(cmd, "echo") {
-			exec.Command("sh", "-c", cmd).Run()
-		} else {
-			exec.Command("sh", "-c", cmd).Run()
-		}
+		exec.Command("sh", "-c", cmd).Run()
 	}
 
 	// Запустить UDP прокси
@@ -538,7 +537,78 @@ func (p *SNIProxy) setupUDPForward() error {
 	targetAddr := targetIP + ":" + targetPort
 	go p.proxyUDP(udpConn, targetAddr)
 
+	// Запустить TCP прокси для Supercell
+	go p.proxyTCPSupercell(targetAddr)
+
 	return nil
+}
+
+// proxyTCPSupercell проксирует TCP трафик для Supercell игр
+func (p *SNIProxy) proxyTCPSupercell(targetAddr string) {
+	// Слушаем TCP на порту 9339
+	tcpAddr, err := net.ResolveTCPAddr("tcp", ":9339")
+	if err != nil {
+		p.logger.Printf("[%s] ERROR ❌ TCP resolve: %v",
+			time.Now().Format("2006-01-02 15:04:05"), err)
+		return
+	}
+
+	tcpLn, err := net.ListenTCP("tcp", tcpAddr)
+	if err != nil {
+		p.logger.Printf("[%s] ERROR ❌ TCP listen: %v",
+			time.Now().Format("2006-01-02 15:04:05"), err)
+		return
+	}
+	defer tcpLn.Close()
+
+	p.logger.Printf("[%s] INFO 🎮 TCP Supercell listener on :9339 -> %s",
+		time.Now().Format("2006-01-02 15:04:05"), targetAddr)
+
+	for {
+		select {
+		case <-p.shutdown:
+			return
+		default:
+		}
+
+		tcpLn.SetDeadline(time.Now().Add(2 * time.Second))
+		clientConn, err := tcpLn.AcceptTCP()
+		if err != nil {
+			continue
+		}
+
+		clientAddr := clientConn.RemoteAddr().String()
+		p.logger.Printf("[%s] INFO 🎮 TCP: %s -> %s",
+			time.Now().Format("2006-01-02 15:04:05"), clientAddr, targetAddr)
+
+		// Подключиться к серверу
+		serverConn, err := net.Dial("tcp", targetAddr)
+		if err != nil {
+			p.logger.Printf("[%s] ERROR ❌ TCP connect: %v",
+				time.Now().Format("2006-01-02 15:04:05"), err)
+			clientConn.Close()
+			continue
+		}
+
+		// Копировать трафик
+		go func(clientConn, serverConn *net.TCPConn) {
+			defer clientConn.Close()
+			defer serverConn.Close()
+
+			done := make(chan struct{}, 2)
+			go func() {
+				io.Copy(serverConn, clientConn)
+				done <- struct{}{}
+			}()
+			go func() {
+				io.Copy(clientConn, serverConn)
+				done <- struct{}{}
+			}()
+
+			<-done
+			<-done
+		}(clientConn, serverConn.(*net.TCPConn))
+	}
 }
 
 // proxyUDP проксирует UDP трафик
