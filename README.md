@@ -1,6 +1,8 @@
-# 🎮 Game SNI Proxy
+# 🎮 SNIx — Game SNI Proxy
 
 SNI-прокси для маршрутизации игрового трафика (Supercell, mo.co) на основе доменного имени из TLS ClientHello.
+
+Используется для **astracat.ru**
 
 ## 📖 Описание
 
@@ -217,5 +219,4 @@ Pull requests приветствуются! Для крупных изменен
 
 ## 📞 Контакты
 
-- GitHub Issues: [Открыть issue](https://github.com/yourusername/game-sni-proxy/issues)
-- Email: your.email@example.com
+- GitHub Issues: [Открыть issue](https://github.com/ASTRACAT2022/SNIx/issues)
