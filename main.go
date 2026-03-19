@@ -296,8 +296,8 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 	}
 
 	if sni == "" {
-		p.logger.Printf("[%s] WARN ⚠️ Пустой SNI от %s",
-			time.Now().Format("2006-01-02 15:04:05"), clientAddr)
+		p.logger.Printf("[%s] WARN ⚠️ Пустой SNI от %s (буфер %d байт)",
+			time.Now().Format("2006-01-02 15:04:05"), clientAddr, len(headerBuf))
 		return
 	}
 
