@@ -335,19 +335,23 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 
 	// Найти игру по SNI
 	game := p.findGameBySNI(sni, listenPort)
-	
+
 	// Если не найдено в конфиге и разрешено проксирование неизвестных
 	if game == nil {
 		if p.config.AllowUnknownSNI {
-			// Проксировать на тот же домен
+			// Проксировать на тот же домен, порт 443 для HTTPS
+			targetPort := listenPort
+			if listenPort == 9339 || listenPort == 30000 {
+				targetPort = 443 // Игровые порты мапим на 443
+			}
 			game = &Game{
 				Name:       "Unknown (auto-proxy)",
 				Domains:    []string{sni},
 				Port:       listenPort,
-				TargetPort: listenPort,
+				TargetPort: targetPort,
 			}
-			p.logger.Printf("[%s] INFO  🔄 Auto-proxy: %s от %s",
-				time.Now().Format("2006-01-02 15:04:05"), sni, clientAddr)
+			p.logger.Printf("[%s] INFO  🔄 Auto-proxy: %s от %s (порт %d)",
+				time.Now().Format("2006-01-02 15:04:05"), sni, clientAddr, targetPort)
 		} else {
 			p.logger.Printf("[%s] WARN  ⚠️ Неизвестный SNI: %s от %s",
 				time.Now().Format("2006-01-02 15:04:05"), sni, clientAddr)
@@ -398,25 +402,30 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 	}
 
 	// Копировать трафик в обе стороны
-	done := make(chan struct{}, 2)
+	errChan := make(chan error, 2)
 	idleTimeout := time.Duration(p.config.IdleTimeout) * time.Second
 
 	go func() {
-		copyWithTimeout(serverConn, clientConn, idleTimeout)
-		done <- struct{}{}
+		errChan <- copyWithTimeout(serverConn, clientConn, idleTimeout)
 	}()
 
 	go func() {
-		copyWithTimeout(clientConn, serverConn, idleTimeout)
-		done <- struct{}{}
+		errChan <- copyWithTimeout(clientConn, serverConn, idleTimeout)
 	}()
 
-	// Ждать завершения хотя бы одного направления
-	<-done
+	// Ждать ошибку из любого направления
+	<-errChan
+	
+	// Закрыть соединения
+	clientConn.Close()
+	serverConn.Close()
+	
+	// Ждать второе направление
+	<-errChan
 }
 
 // copyWithTimeout копирует данные с таймаутом бездействия
-func copyWithTimeout(dst net.Conn, src net.Conn, timeout time.Duration) {
+func copyWithTimeout(dst net.Conn, src net.Conn, timeout time.Duration) error {
 	// Отключаем Nagle's algorithm для уменьшения задержек
 	if tcpConn, ok := dst.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
@@ -433,15 +442,14 @@ func copyWithTimeout(dst net.Conn, src net.Conn, timeout time.Duration) {
 		if n > 0 {
 			dst.SetWriteDeadline(time.Now().Add(timeout))
 			if _, werr := dst.Write(buf[:n]); werr != nil {
-				return
-			}
-			// Flush для TCP
-			if tcpConn, ok := dst.(*net.TCPConn); ok {
-				tcpConn.SetWriteDeadline(time.Time{}) // Сброс таймаута после записи
+				return fmt.Errorf("ошибка записи: %w", werr)
 			}
 		}
 		if err != nil {
-			return
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				return nil // Нормальный таймаут бездействия
+			}
+			return err
 		}
 	}
 }
