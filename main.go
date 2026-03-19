@@ -168,84 +168,93 @@ func NewSNIProxy(config *Config) (*SNIProxy, error) {
 
 // extractSNI извлекает SNI из TLS ClientHello
 func extractSNI(conn net.Conn) (string, error) {
+	sni, _, err := extractSNIWithBuffer(conn)
+	return sni, err
+}
+
+// extractSNIWithBuffer извлекает SNI и возвращает буфер с ClientHello
+func extractSNIWithBuffer(conn net.Conn) (string, []byte, error) {
 	// Установить таймаут чтения
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 
 	// Читать первые 5 байт (заголовок TLS)
 	header := make([]byte, 5)
 	if _, err := io.ReadFull(conn, header); err != nil {
-		return "", fmt.Errorf("ошибка чтения заголовка TLS: %w", err)
+		return "", nil, fmt.Errorf("ошибка чтения заголовка TLS: %w", err)
 	}
 
 	// Проверить тип записи (Content Type = 0x16 для Handshake)
 	if header[0] != 0x16 {
-		return "", fmt.Errorf("не TLS handshake: type=%d", header[0])
+		return "", nil, fmt.Errorf("не TLS handshake: type=%d", header[0])
 	}
 
 	// Проверить версию TLS
 	version := binary.BigEndian.Uint16(header[1:3])
 	if version < 0x0301 || version > 0x0304 {
-		return "", fmt.Errorf("неподдерживаемая версия TLS: 0x%04x", version)
+		return "", nil, fmt.Errorf("неподдерживаемая версия TLS: 0x%04x", version)
 	}
 
 	// Получить длину записи
 	length := int(binary.BigEndian.Uint16(header[3:5]))
 	if length > 65535 {
-		return "", fmt.Errorf("слишком большая запись: %d", length)
+		return "", nil, fmt.Errorf("слишком большая запись: %d", length)
 	}
 
 	// Читать всю запись Handshake
 	handshake := make([]byte, length)
 	if _, err := io.ReadFull(conn, handshake); err != nil {
-		return "", fmt.Errorf("ошибка чтения handshake: %w", err)
+		return "", nil, fmt.Errorf("ошибка чтения handshake: %w", err)
 	}
+
+	// Собрать полный буфер (header + handshake)
+	fullBuf := append(header, handshake...)
 
 	// Пропустить тип handshake (1 байт) и длину (3 байта)
 	if len(handshake) < 4 {
-		return "", fmt.Errorf("слишком короткий handshake")
+		return "", fullBuf, fmt.Errorf("слишком короткий handshake")
 	}
 
 	// Пропустить версию TLS и random (2 + 32 байта)
 	if len(handshake) < 38 {
-		return "", fmt.Errorf("слишком короткий handshake для версии/random")
+		return "", fullBuf, fmt.Errorf("слишком короткий handshake для версии/random")
 	}
 
 	// Пропустить session ID (1 байт длина + сама сессия)
 	sessionIDLen := int(handshake[38])
 	offset := 39 + sessionIDLen
 	if offset > len(handshake) {
-		return "", fmt.Errorf("некорректная длина session ID")
+		return "", fullBuf, fmt.Errorf("некорректная длина session ID")
 	}
 
 	// Пропустить cipher suites (2 байта длина + сами шифры)
 	if offset+2 > len(handshake) {
-		return "", fmt.Errorf("некорректная длина cipher suites")
+		return "", fullBuf, fmt.Errorf("некорректная длина cipher suites")
 	}
 	cipherSuiteLen := int(binary.BigEndian.Uint16(handshake[offset : offset+2]))
 	offset += 2 + cipherSuiteLen
 	if offset > len(handshake) {
-		return "", fmt.Errorf("некорректная длина cipher suites")
+		return "", fullBuf, fmt.Errorf("некорректная длина cipher suites")
 	}
 
 	// Пропустить compression methods (1 байт длина + методы)
 	if offset+1 > len(handshake) {
-		return "", fmt.Errorf("некорректная длина compression methods")
+		return "", fullBuf, fmt.Errorf("некорректная длина compression methods")
 	}
 	compressionLen := int(handshake[offset])
 	offset += 1 + compressionLen
 	if offset > len(handshake) {
-		return "", fmt.Errorf("некорректная длина compression methods")
+		return "", fullBuf, fmt.Errorf("некорректная длина compression methods")
 	}
 
 	// Проверить наличие extensions
 	if offset+2 > len(handshake) {
-		return "", nil // Нет extensions
+		return "", fullBuf, nil // Нет extensions
 	}
 	extensionsLen := int(binary.BigEndian.Uint16(handshake[offset : offset+2]))
 	offset += 2
 
 	if offset+extensionsLen > len(handshake) {
-		return "", fmt.Errorf("некорректная длина extensions")
+		return "", fullBuf, fmt.Errorf("некорректная длина extensions")
 	}
 
 	// Парсить extensions
@@ -266,14 +275,14 @@ func extractSNI(conn net.Conn) (string, error) {
 			nameLen := int(binary.BigEndian.Uint16(handshake[offset+3 : offset+5]))
 			if offset+5+nameLen <= extensionsEnd {
 				sni := string(handshake[offset+5 : offset+5+nameLen])
-				return sni, nil
+				return sni, fullBuf, nil
 			}
 		}
 
 		offset += extLen
 	}
 
-	return "", nil
+	return "", fullBuf, nil
 }
 
 // findGameBySNI находит игру по SNI
@@ -309,8 +318,8 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 
 	clientAddr := clientConn.RemoteAddr().String()
 
-	// Извлечь SNI
-	sni, err := extractSNI(clientConn)
+	// Извлечь SNI (читаем первые байты)
+	sni, headerBuf, err := extractSNIWithBuffer(clientConn)
 	if err != nil {
 		p.logger.Printf("[%s] WARN  ⚠️ Ошибка извлечения SNI от %s: %v",
 			time.Now().Format("2006-01-02 15:04:05"), clientAddr, err)
@@ -366,6 +375,13 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 	p.logger.Printf("[%s] INFO  ✅ %s -> %s (%s)",
 		time.Now().Format("2006-01-02 15:04:05"), clientAddr, targetAddr, sni)
 
+	// Отправить ClientHello на сервер
+	if _, err := serverConn.Write(headerBuf); err != nil {
+		p.logger.Printf("[%s] ERROR ❌ Ошибка отправки ClientHello: %v",
+			time.Now().Format("2006-01-02 15:04:05"), err)
+		return
+	}
+
 	// Копировать трафик в обе стороны
 	done := make(chan struct{}, 2)
 	idleTimeout := time.Duration(p.config.IdleTimeout) * time.Second
@@ -376,7 +392,6 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 	}()
 
 	go func() {
-		// Отправить сохранённый ClientHello серверу
 		copyWithTimeout(clientConn, serverConn, idleTimeout)
 		done <- struct{}{}
 	}()
@@ -387,19 +402,29 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 
 // copyWithTimeout копирует данные с таймаутом бездействия
 func copyWithTimeout(dst net.Conn, src net.Conn, timeout time.Duration) {
+	// Отключаем Nagle's algorithm для уменьшения задержек
+	if tcpConn, ok := dst.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+	}
+	if tcpConn, ok := src.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+	}
+
+	buf := make([]byte, 64*1024) // Увеличенный буфер
 	for {
 		src.SetReadDeadline(time.Now().Add(timeout))
-		
-		buf := make([]byte, 32*1024)
+
 		n, err := src.Read(buf)
-		
 		if n > 0 {
 			dst.SetWriteDeadline(time.Now().Add(timeout))
 			if _, werr := dst.Write(buf[:n]); werr != nil {
 				return
 			}
+			// Flush для TCP
+			if tcpConn, ok := dst.(*net.TCPConn); ok {
+				tcpConn.SetWriteDeadline(time.Time{}) // Сброс таймаута после записи
+			}
 		}
-		
 		if err != nil {
 			return
 		}
