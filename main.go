@@ -178,13 +178,13 @@ func extractSNIWithBuffer(conn net.Conn) (string, []byte, error) {
 
 	// Проверить тип записи (0x16 = Handshake)
 	if header[0] != 0x16 {
-		return "", nil, fmt.Errorf("не TLS handshake: type=%d", header[0])
+		return "", nil, fmt.Errorf("не TLS handshake: type=%d (возможно HTTP/2 или WebSocket)", header[0])
 	}
 
 	// Получить длину записи
 	length := int(binary.BigEndian.Uint16(header[3:5]))
 	if length > 65535 || length < 100 {
-		return "", nil, fmt.Errorf("некорректная длина записи: %d", length)
+		return "", nil, fmt.Errorf("некорректная длина записи: %d байт (ClientHello должен быть 100-500 байт)", length)
 	}
 
 	// Читать ВСЁ сообщение handshake
