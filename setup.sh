@@ -38,18 +38,51 @@ git pull
 
 # Скомпилировать
 echo "🔨 Компиляция..."
-go build -o sni-proxy -ldflags="-s -w" main.go
+go build -o proxy -ldflags="-s -w" main.go
 
-# Запустить
-echo "🚀 Запуск SNI Proxy..."
-nohup ./sni-proxy config.json > /dev/null 2>&1 &
+# Установка systemd сервиса
+echo "⚙️ Настройка systemd службы..."
+
+# Получаем текущую директорию (где лежит скрипт и проект)
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Создаем файл сервиса динамически с правильными путями
+cat > /etc/systemd/system/sni-proxy.service <<EOF
+[Unit]
+Description=Game SNI Proxy
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=${DIR}
+ExecStart=${DIR}/proxy ${DIR}/config.json
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sni-proxy
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Перезагружаем systemd и запускаем
+systemctl daemon-reload
+systemctl enable sni-proxy
+systemctl restart sni-proxy
 sleep 3
 
 # Проверить запуск
-if pgrep -x "sni-proxy" > /dev/null; then
-    echo -e "${GREEN}✅ SNI Proxy запущен!${NC}"
+if systemctl is-active --quiet sni-proxy; then
+    echo -e "${GREEN}✅ SNI Proxy запущен как systemd служба!${NC}"
 else
-    echo -e "${RED}❌ Ошибка запуска!${NC}"
+    echo -e "${RED}❌ Ошибка запуска службы! Проверьте логи: journalctl -u sni-proxy -e${NC}"
     exit 1
 fi
 
@@ -65,27 +98,22 @@ echo "=========="
 echo "Порты:"
 ss -tlnp | grep -E "(9339|443|30000)" || echo "  Нет активных портов"
 
-# Проверить iptables
-echo ""
-echo "iptables правила:"
-iptables -t nat -L PREROUTING -n -v | grep 9339 || echo "  Нет правил для 9339"
-
 # Показать логи
 echo ""
-echo "Последние логи:"
-tail -20 logs/proxy.log | grep -E "(🎮|TCP|UDP|Listening)" || echo "  Нет логов"
+echo "Последние логи (journalctl):"
+journalctl -u sni-proxy -n 10 --no-pager | grep -E "(🎮|TCP|UDP|Listening)" || echo "  Нет логов"
 
 echo ""
 echo "========================"
-echo -e "${GREEN}✅ Готово!${NC}"
+echo -e "${GREEN}✅ Установка завершена! Прокси работает в фоне (systemctl).${NC}"
 echo ""
 echo "📱 Для подключения игр:"
 echo "   1. Установите DNS на телефоне = $EXTERNAL_IP"
 echo "   2. Запустите игру (Brawl Stars, Clash Royale, etc.)"
 echo ""
-echo "📊 Мониторинг логов:"
-echo "   tail -f logs/proxy.log | grep -E '(🎮|TCP|9339|brawl)'"
+echo "📊 Мониторинг логов в реальном времени:"
+echo "   journalctl -u sni-proxy -f"
 echo ""
-echo "🛑 Остановка:"
-echo "   pkill sni-proxy"
+echo "🛑 Остановка службы:"
+echo "   systemctl stop sni-proxy"
 echo ""
