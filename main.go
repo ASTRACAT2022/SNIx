@@ -291,28 +291,29 @@ func (p *SNIProxy) findGameBySNI(sni string, port int) *Game {
 func (p *SNIProxy) handleRawConnection(clientConn net.Conn, listenPort int) {
 	clientAddr := clientConn.RemoteAddr().String()
 
-	var targetAddr string
-	if listenPort == 9339 || listenPort == 30000 {
-		targetIP := "18.196.54.123" // default fallback
-		targetPort := listenPort
-		
-		// Ищем игру по порту, чтобы взять её target_ip если задан
-		for _, g := range p.config.Games {
-			if g.Port == listenPort {
-				if g.TargetIP != "" {
-					targetIP = g.TargetIP
-				}
-				if g.TargetPort > 0 {
-					targetPort = g.TargetPort
-				}
-				break
-			}
-		}
-		
-		targetAddr = fmt.Sprintf("%s:%d", targetIP, targetPort)
+	var targetDomain string
+	var targetPort int
+
+	// Эмуляция поведения Nginx (proxy_pass game.brawlstarsgame.com:9339)
+	if listenPort == 9339 {
+		targetDomain = "game.brawlstarsgame.com"
+		targetPort = 9339
+	} else if listenPort == 30000 {
+		targetDomain = "game.mocogame.com"
+		targetPort = 30000
 	} else {
 		return
 	}
+
+	// Резолвим IP-адрес для домена (как это делает Nginx)
+	ips, err := net.LookupIP(targetDomain)
+	if err != nil || len(ips) == 0 {
+		p.logger.Printf("[%s] ERROR ❌ DNS ошибка для %s: %v",
+			time.Now().Format("2006-01-02 15:04:05"), targetDomain, err)
+		return
+	}
+
+	targetAddr := fmt.Sprintf("%s:%d", ips[0].String(), targetPort)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.config.ConnectionTimeout)*time.Second)
 	defer cancel()
@@ -320,35 +321,14 @@ func (p *SNIProxy) handleRawConnection(clientConn net.Conn, listenPort int) {
 	var dialer net.Dialer
 	serverConn, err := dialer.DialContext(ctx, "tcp", targetAddr)
 	if err != nil {
-		// Если не удалось подключиться к заданному IP (например, таймаут), пробуем другой известный IP (fallbacks)
-		fallbacks := []string{"18.196.54.123", "3.120.158.117", "18.195.148.243"}
-		connected := false
-		
-		p.logger.Printf("[%s] WARN ⚠️ Ошибка подключения к %s: %v. Пробуем резервные IP...", 
+		p.logger.Printf("[%s] ERROR ❌ Подключение к %s (Raw TCP): %v",
 			time.Now().Format("2006-01-02 15:04:05"), targetAddr, err)
-			
-		for _, fb := range fallbacks {
-			if fb == targetAddr { continue }
-			
-			fbAddr := fmt.Sprintf("%s:%d", fb, listenPort)
-			serverConn, err = dialer.DialContext(ctx, "tcp", fbAddr)
-			if err == nil {
-				targetAddr = fbAddr
-				connected = true
-				break
-			}
-		}
-		
-		if !connected {
-			p.logger.Printf("[%s] ERROR ❌ Все резервные подключения к %s (Raw TCP) провалились",
-				time.Now().Format("2006-01-02 15:04:05"), targetAddr)
-			return
-		}
+		return
 	}
 	defer serverConn.Close()
 
-	p.logger.Printf("[%s] INFO 🎮 TCP Raw: %s -> %s",
-		time.Now().Format("2006-01-02 15:04:05"), clientAddr, targetAddr)
+	p.logger.Printf("[%s] INFO 🎮 TCP Raw: %s -> %s (%s)",
+		time.Now().Format("2006-01-02 15:04:05"), clientAddr, targetAddr, targetDomain)
 
 	// Настроить соединения
 	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
@@ -586,54 +566,18 @@ func (p *SNIProxy) Start() error {
 
 // setupUDPForward настраивает UDP проброс для игр
 func (p *SNIProxy) setupUDPForward() error {
-	// Распарсить target
-	targetParts := strings.Split(p.config.UDPForwardTarget, ":")
-	if len(targetParts) != 2 {
-		return fmt.Errorf("некорректный UDP target: %s", p.config.UDPForwardTarget)
-	}
-	targetIP := targetParts[0]
-	targetPort := targetParts[1]
-
-	// Проверить конфиг на наличие явно заданного IP для порта 9339
-	for _, g := range p.config.Games {
-		if g.Port == 9339 && g.TargetIP != "" {
-			targetIP = g.TargetIP
-			if g.TargetPort > 0 {
-				targetPort = fmt.Sprintf("%d", g.TargetPort)
-			}
-			break
-		}
+	// Резолвим IP-адрес для домена (как это делает Nginx)
+	targetDomain := "game.brawlstarsgame.com"
+	targetPort := "9339"
+	
+	ips, err := net.LookupIP(targetDomain)
+	if err != nil || len(ips) == 0 {
+		return fmt.Errorf("DNS ошибка для %s: %v", targetDomain, err)
 	}
 
-	// Найти IP через DNS для Supercell (только если не задан жестко или для подстраховки)
-	// Важно: в России DNS может выдавать заблокированные IP-адреса Amazon (AWS),
-	// поэтому приоритет всегда отдаем IP-адресу из конфига.
-	if targetIP == "" || targetIP == targetParts[0] {
-		ips, err := p.resolver.Resolve("game.brawlstarsgame.com")
-		if err == nil && len(ips) > 0 {
-			// Проверяем, не заблокирован ли этот IP (Amazon) - простая эвристика
-			// Обычно заблокированы 18.x.x.x, 3.x.x.x, 52.x.x.x, 44.x.x.x и т.д.
-			// Лучше просто не использовать DNS для Brawl Stars, если есть рабочий IP.
-			dnsIP := ips[0].String()
-			if !strings.HasPrefix(dnsIP, "18.") && !strings.HasPrefix(dnsIP, "44.") && !strings.HasPrefix(dnsIP, "52.") {
-				targetIP = dnsIP
-				p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:%s (Brawl Stars DNS)",
-					time.Now().Format("2006-01-02 15:04:05"), targetIP, targetPort)
-			} else {
-				// Если DNS выдал подозрительный AWS IP, используем известный рабочий fallback
-				targetIP = "3.120.158.117"
-				p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:%s (Fallback IP, DNS blocked: %s)",
-					time.Now().Format("2006-01-02 15:04:05"), targetIP, targetPort, dnsIP)
-			}
-		} else {
-			targetIP = "3.120.158.117"
-			p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:%s (Fallback IP)",
-				time.Now().Format("2006-01-02 15:04:05"), targetIP, targetPort)
-		}
-	} else {
-		p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:%s (Config IP)",
-			time.Now().Format("2006-01-02 15:04:05"), targetIP, targetPort)
-	}
+	targetIP := ips[0].String()
+	p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:%s (%s)",
+		time.Now().Format("2006-01-02 15:04:05"), targetIP, targetPort, targetDomain)
 
 	// Настроить iptables для UDP (отключено, так как Go сам проксирует UDP и TCP корректно)
 	// и без MASQUERADE правила iptables ломают маршрутизацию (асимметричный роутинг)
