@@ -614,11 +614,20 @@ func (p *SNIProxy) setupUDPForward() error {
 			// Проверяем, не заблокирован ли этот IP (Amazon) - простая эвристика
 			// Обычно заблокированы 18.x.x.x, 3.x.x.x, 52.x.x.x, 44.x.x.x и т.д.
 			// Лучше просто не использовать DNS для Brawl Stars, если есть рабочий IP.
-			targetIP = ips[0].String()
-			p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:%s (Brawl Stars DNS)",
-				time.Now().Format("2006-01-02 15:04:05"), targetIP, targetPort)
+			dnsIP := ips[0].String()
+			if !strings.HasPrefix(dnsIP, "18.") && !strings.HasPrefix(dnsIP, "44.") && !strings.HasPrefix(dnsIP, "52.") {
+				targetIP = dnsIP
+				p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:%s (Brawl Stars DNS)",
+					time.Now().Format("2006-01-02 15:04:05"), targetIP, targetPort)
+			} else {
+				// Если DNS выдал подозрительный AWS IP, используем известный рабочий fallback
+				targetIP = "3.120.158.117"
+				p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:%s (Fallback IP, DNS blocked: %s)",
+					time.Now().Format("2006-01-02 15:04:05"), targetIP, targetPort, dnsIP)
+			}
 		} else {
-			p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:%s",
+			targetIP = "3.120.158.117"
+			p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:%s (Fallback IP)",
 				time.Now().Format("2006-01-02 15:04:05"), targetIP, targetPort)
 		}
 	} else {
