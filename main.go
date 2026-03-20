@@ -291,44 +291,84 @@ func (p *SNIProxy) findGameBySNI(sni string, port int) *Game {
 func (p *SNIProxy) handleRawConnection(clientConn net.Conn, listenPort int) {
 	clientAddr := clientConn.RemoteAddr().String()
 
-	var targetDomain string
-	var targetPort int
-
-	// Эмуляция поведения Nginx (proxy_pass game.brawlstarsgame.com:9339)
-	if listenPort == 9339 {
-		targetDomain = "game.brawlstarsgame.com"
-		targetPort = 9339
-	} else if listenPort == 30000 {
-		targetDomain = "game.mocogame.com"
-		targetPort = 30000
-	} else {
+	// Для порта 30000 (Squad Busters / Moco) логика простая
+	if listenPort == 30000 {
+		p.proxyToDomain(clientConn, "game.mocogame.com", 30000)
 		return
 	}
 
-	// Резолвим IP-адрес для домена (как это делает Nginx)
-	ips, err := net.LookupIP(targetDomain)
-	if err != nil || len(ips) == 0 {
-		p.logger.Printf("[%s] ERROR ❌ DNS ошибка для %s: %v",
-			time.Now().Format("2006-01-02 15:04:05"), targetDomain, err)
+	if listenPort != 9339 {
+		clientConn.Close()
 		return
 	}
 
-	targetAddr := fmt.Sprintf("%s:%d", ips[0].String(), targetPort)
+	// === УМНАЯ МАРШРУТИЗАЦИЯ ДЛЯ ПОРТА 9339 (BRAWL STARS + CLASH ROYALE + CLASH OF CLANS) ===
+	// Поскольку мы не знаем, из какой игры пришел игрок (нет SNI),
+	// мы читаем первый пакет от клиента, чтобы понять, что это за игра,
+	// либо пробуем универсальный подход: перебор серверов.
+
+	clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	firstPacket := make([]byte, 8192)
+	n, err := clientConn.Read(firstPacket)
+	if err != nil || n == 0 {
+		clientConn.Close()
+		return
+	}
+	clientConn.SetReadDeadline(time.Time{}) // Сбрасываем таймаут
+
+	// Выбираем список доменов для попытки подключения
+	targetDomains := []string{
+		"game.brawlstarsgame.com",
+		"game.clashroyaleapp.com",
+		"gamea.clashofclans.com",
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.config.ConnectionTimeout)*time.Second)
 	defer cancel()
 
-	var dialer net.Dialer
-	serverConn, err := dialer.DialContext(ctx, "tcp", targetAddr)
-	if err != nil {
-		p.logger.Printf("[%s] ERROR ❌ Подключение к %s (Raw TCP): %v",
-			time.Now().Format("2006-01-02 15:04:05"), targetAddr, err)
+	var serverConn net.Conn
+	var connectedDomain string
+
+	// Пытаемся подключиться к серверам по очереди.
+	// Первый ответивший сервер и принявший первый пакет будет нашим таргетом.
+	for _, domain := range targetDomains {
+		ips, err := net.LookupIP(domain)
+		if err != nil || len(ips) == 0 {
+			continue
+		}
+
+		targetAddr := fmt.Sprintf("%s:%d", ips[0].String(), 9339)
+		var dialer net.Dialer
+		conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
+		if err != nil {
+			continue
+		}
+
+		// Отправляем первый пакет, который мы уже прочитали у клиента
+		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		_, err = conn.Write(firstPacket[:n])
+		conn.SetWriteDeadline(time.Time{})
+		
+		if err == nil {
+			// Успешно подключились и отправили рукопожатие
+			serverConn = conn
+			connectedDomain = domain
+			break
+		}
+		conn.Close()
+	}
+
+	if serverConn == nil {
+		p.logger.Printf("[%s] ERROR ❌ Все серверы Supercell (Raw TCP) недоступны для %s",
+			time.Now().Format("2006-01-02 15:04:05"), clientAddr)
+		clientConn.Close()
 		return
 	}
 	defer serverConn.Close()
+	defer clientConn.Close()
 
-	p.logger.Printf("[%s] INFO 🎮 TCP Raw: %s -> %s (%s)",
-		time.Now().Format("2006-01-02 15:04:05"), clientAddr, targetAddr, targetDomain)
+	p.logger.Printf("[%s] INFO 🎮 TCP Smart Route: %s -> %s (Port 9339)",
+		time.Now().Format("2006-01-02 15:04:05"), clientAddr, connectedDomain)
 
 	// Настроить соединения
 	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
@@ -359,6 +399,36 @@ func (p *SNIProxy) handleRawConnection(clientConn net.Conn, listenPort int) {
 		bytes := copyData(clientConn, serverConn, readTimeout, idleTimeout)
 		done <- bytes
 	}()
+
+	<-done
+	<-done
+}
+
+// proxyToDomain простая обертка для проксирования на конкретный домен
+func (p *SNIProxy) proxyToDomain(clientConn net.Conn, targetDomain string, targetPort int) {
+	defer clientConn.Close()
+	ips, err := net.LookupIP(targetDomain)
+	if err != nil || len(ips) == 0 {
+		return
+	}
+
+	targetAddr := fmt.Sprintf("%s:%d", ips[0].String(), targetPort)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.config.ConnectionTimeout)*time.Second)
+	defer cancel()
+
+	var dialer net.Dialer
+	serverConn, err := dialer.DialContext(ctx, "tcp", targetAddr)
+	if err != nil {
+		return
+	}
+	defer serverConn.Close()
+
+	done := make(chan int64, 2)
+	readTimeout := 300 * time.Second
+	idleTimeout := time.Duration(p.config.IdleTimeout) * time.Second
+
+	go func() { done <- copyData(serverConn, clientConn, readTimeout, idleTimeout) }()
+	go func() { done <- copyData(clientConn, serverConn, readTimeout, idleTimeout) }()
 
 	<-done
 	<-done
@@ -566,7 +636,8 @@ func (p *SNIProxy) Start() error {
 
 // setupUDPForward настраивает UDP проброс для игр
 func (p *SNIProxy) setupUDPForward() error {
-	// Резолвим IP-адрес для домена (как это делает Nginx)
+	// Для UDP мы используем простой подход: проксируем на универсальный домен brawlstars,
+	// так как UDP используется только для боев в Brawl Stars (Clash Royale работает по TCP).
 	targetDomain := "game.brawlstarsgame.com"
 	targetPort := "9339"
 	
