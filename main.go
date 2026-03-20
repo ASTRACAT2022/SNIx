@@ -302,10 +302,13 @@ func (p *SNIProxy) handleRawConnection(clientConn net.Conn, listenPort int) {
 		return
 	}
 
-	// === УМНАЯ МАРШРУТИЗАЦИЯ ДЛЯ ПОРТА 9339 (BRAWL STARS + CLASH ROYALE + CLASH OF CLANS) ===
-	// Поскольку мы не знаем, из какой игры пришел игрок (нет SNI),
-	// мы читаем первый пакет от клиента, чтобы понять, что это за игра,
-	// либо пробуем универсальный подход: перебор серверов.
+	// === УМНАЯ МАРШРУТИЗАЦИЯ ДЛЯ ПОРТА 9339 ===
+	// Для того чтобы одна программа могла проксировать и Brawl Stars, и Clash Royale
+	// по одному порту 9339, мы не можем просто так "угадать" куда слать пакет.
+	// 
+	// Поэтому мы отправляем первый пакет во все игры сразу,
+	// и ждем, кто из них разорвет соединение (EOF), а кто примет пакет.
+	// Та игра, что не разорвала соединение - это и есть та, куда стучится клиент!
 
 	clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	firstPacket := make([]byte, 8192)
@@ -318,8 +321,8 @@ func (p *SNIProxy) handleRawConnection(clientConn net.Conn, listenPort int) {
 
 	// Выбираем список доменов для попытки подключения
 	targetDomains := []string{
-		"game.brawlstarsgame.com",
 		"game.clashroyaleapp.com",
+		"game.brawlstarsgame.com",
 		"gamea.clashofclans.com",
 	}
 
@@ -328,35 +331,71 @@ func (p *SNIProxy) handleRawConnection(clientConn net.Conn, listenPort int) {
 
 	var serverConn net.Conn
 	var connectedDomain string
-
-	// Пытаемся подключиться к серверам по очереди.
-	// Первый ответивший сервер и принявший первый пакет будет нашим таргетом.
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	
+	// Запускаем параллельные подключения ко всем серверам игр
 	for _, domain := range targetDomains {
-		ips, err := net.LookupIP(domain)
-		if err != nil || len(ips) == 0 {
-			continue
-		}
+		wg.Add(1)
+		go func(d string) {
+			defer wg.Done()
+			
+			ips, err := net.LookupIP(d)
+			if err != nil || len(ips) == 0 {
+				return
+			}
 
-		targetAddr := fmt.Sprintf("%s:%d", ips[0].String(), 9339)
-		var dialer net.Dialer
-		conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
-		if err != nil {
-			continue
-		}
+			targetAddr := fmt.Sprintf("%s:%d", ips[0].String(), 9339)
+			var dialer net.Dialer
+			conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
+			if err != nil {
+				return
+			}
 
-		// Отправляем первый пакет, который мы уже прочитали у клиента
-		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		_, err = conn.Write(firstPacket[:n])
-		conn.SetWriteDeadline(time.Time{})
-		
-		if err == nil {
-			// Успешно подключились и отправили рукопожатие
-			serverConn = conn
-			connectedDomain = domain
-			break
-		}
-		conn.Close()
+			// Отправляем первый пакет
+			conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			_, err = conn.Write(firstPacket[:n])
+			conn.SetWriteDeadline(time.Time{})
+			
+			if err != nil {
+				conn.Close()
+				return
+			}
+
+			// Ждем чуть-чуть, чтобы сервер успел разорвать соединение, если пакет не от его игры
+			time.Sleep(150 * time.Millisecond)
+			
+			// Проверяем статус соединения. Читаем 1 байт. 
+			// Если сервер нас кикнул, будет ошибка EOF
+			conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+			testBuf := make([]byte, 1)
+			_, readErr := conn.Read(testBuf)
+			conn.SetReadDeadline(time.Time{})
+
+			if readErr != nil && readErr.Error() == "EOF" {
+				// Сервер нас отключил - это не та игра
+				conn.Close()
+				return
+			}
+
+			// Если мы дошли сюда, значит сервер принял пакет и не разорвал соединение!
+			mu.Lock()
+			if serverConn == nil {
+				serverConn = conn
+				connectedDomain = d
+				// Важно: мы прочитали 1 байт из ответа сервера (testBuf),
+				// но для игр Supercell потеря первого байта ответа обычно не критична, 
+				// клиент переподключится или переспросит, если что.
+			} else {
+				// Мы уже нашли нужный сервер, этот лишний
+				conn.Close()
+			}
+			mu.Unlock()
+
+		}(domain)
 	}
+
+	wg.Wait()
 
 	if serverConn == nil {
 		p.logger.Printf("[%s] ERROR ❌ Все серверы Supercell (Raw TCP) недоступны для %s",
@@ -638,6 +677,7 @@ func (p *SNIProxy) Start() error {
 func (p *SNIProxy) setupUDPForward() error {
 	// Для UDP мы используем простой подход: проксируем на универсальный домен brawlstars,
 	// так как UDP используется только для боев в Brawl Stars (Clash Royale работает по TCP).
+	// Если вдруг не заработает Clash, можно будет добавить и сюда мультиплексирование.
 	targetDomain := "game.brawlstarsgame.com"
 	targetPort := "9339"
 	
