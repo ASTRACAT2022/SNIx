@@ -296,14 +296,13 @@ func (p *SNIProxy) handleRawConnection(clientConn net.Conn, listenPort int) {
 
 	// Эмуляция поведения Nginx (proxy_pass game.brawlstarsgame.com:9339)
 	if listenPort == 9339 {
-		// К сожалению, бинарный протокол Supercell не позволяет надежно определить игру по первому пакету.
-		// Если мы жестко укажем game.brawlstarsgame.com, Brawl Stars будет работать идеально,
-		// но Clash Royale не зайдет, так как ему нужен свой пул IP.
-		// В Nginx у вас это работало, потому что вы проксировали только ОДНУ игру на порт 9339,
-		// или ваши клиенты использовали разные порты.
-		// 
-		// Оставляем как было в самом стабильном варианте:
 		targetDomain = "game.brawlstarsgame.com"
+		targetPort = 9339
+	} else if listenPort == 9340 {
+		targetDomain = "game.clashroyaleapp.com"
+		targetPort = 9339
+	} else if listenPort == 9341 {
+		targetDomain = "gamea.clashofclans.com"
 		targetPort = 9339
 	} else if listenPort == 30000 {
 		targetDomain = "game.mocogame.com"
@@ -376,8 +375,9 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 	clientAddr := clientConn.RemoteAddr().String()
 	defer clientConn.Close()
 
-	// Для игровых портов без TLS (например, Supercell на 9339) делаем прозрачный TCP-прокси
-	if listenPort == 9339 || listenPort == 30000 {
+	// Для игровых портов без TLS делаем прозрачный TCP-прокси.
+	// 9339 - Brawl Stars, 9340 - Clash Royale, 9341 - Clash of Clans, 30000 - Moco/Squad Busters
+	if listenPort == 9339 || listenPort == 9340 || listenPort == 9341 || listenPort == 30000 {
 		p.handleRawConnection(clientConn, listenPort)
 		return
 	}
@@ -526,7 +526,33 @@ func (p *SNIProxy) Start() error {
 		}
 	}
 
-	// TCP слушатели
+	// Игровые порты для сырого TCP проксирования
+	gamePorts := []int{9339, 9340, 9341, 30000}
+	for _, portNum := range gamePorts {
+		go func(p *SNIProxy, port int) {
+			addr := fmt.Sprintf(":%d", port)
+			listener, err := net.Listen("tcp", addr)
+			if err != nil {
+				p.logger.Printf("[%s] ERROR ❌ Game port %d: %v",
+					time.Now().Format("2006-01-02 15:04:05"), port, err)
+				return
+			}
+			defer listener.Close()
+
+			p.logger.Printf("[%s] INFO 🚀 Listening on port %d",
+				time.Now().Format("2006-01-02 15:04:05"), port)
+
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					continue
+				}
+				go p.handleConnection(conn, port)
+			}
+		}(p, portNum)
+	}
+
+	// TCP слушатели для обычных портов
 	for _, port := range p.config.ListenPorts {
 		addr := fmt.Sprintf(":%d", port)
 		ln, err := net.Listen("tcp", addr)
