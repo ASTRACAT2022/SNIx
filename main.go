@@ -614,7 +614,7 @@ func (p *SNIProxy) setupUDPForward() error {
 		exec.Command("sh", "-c", cmd).Run()
 	}
 
-	// Запустить UDP прокси
+	// Запустить UDP прокси, если не запущен
 	udpAddr, err := net.ResolveUDPAddr("udp", ":9339")
 	if err != nil {
 		return err
@@ -622,7 +622,9 @@ func (p *SNIProxy) setupUDPForward() error {
 
 	udpConn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
-		return fmt.Errorf("UDP listen: %w", err)
+		p.logger.Printf("[%s] WARN ⚠️ UDP listen: %v. Возможно, порт уже занят или мы перезапускаемся. Игнорируем...",
+			time.Now().Format("2006-01-02 15:04:05"), err)
+		return nil // Не роняем всё приложение, если UDP порт занят
 	}
 
 	p.udpConns = append(p.udpConns, *udpConn)
