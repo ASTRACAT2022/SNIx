@@ -23,6 +23,7 @@ type Game struct {
 	Domains    []string `json:"domains"`
 	Port       int      `json:"port"`
 	TargetPort int      `json:"target_port"`
+	TargetIP   string   `json:"target_ip,omitempty"`
 }
 
 // Config представляет полную конфигурацию прокси
@@ -286,10 +287,92 @@ func (p *SNIProxy) findGameBySNI(sni string, port int) *Game {
 	return nil
 }
 
+// handleRawConnection обрабатывает прямое TCP-подключение без SNI (для игр)
+func (p *SNIProxy) handleRawConnection(clientConn net.Conn, listenPort int) {
+	clientAddr := clientConn.RemoteAddr().String()
+
+	var targetAddr string
+	if listenPort == 9339 || listenPort == 30000 {
+		targetIP := "18.196.54.123" // default fallback
+		targetPort := listenPort
+		
+		// Ищем игру по порту, чтобы взять её target_ip если задан
+		for _, g := range p.config.Games {
+			if g.Port == listenPort {
+				if g.TargetIP != "" {
+					targetIP = g.TargetIP
+				}
+				if g.TargetPort > 0 {
+					targetPort = g.TargetPort
+				}
+				break
+			}
+		}
+		
+		targetAddr = fmt.Sprintf("%s:%d", targetIP, targetPort)
+	} else {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.config.ConnectionTimeout)*time.Second)
+	defer cancel()
+
+	var dialer net.Dialer
+	serverConn, err := dialer.DialContext(ctx, "tcp", targetAddr)
+	if err != nil {
+		p.logger.Printf("[%s] ERROR ❌ Подключение к %s (Raw TCP): %v",
+			time.Now().Format("2006-01-02 15:04:05"), targetAddr, err)
+		return
+	}
+	defer serverConn.Close()
+
+	p.logger.Printf("[%s] INFO 🎮 TCP Raw: %s -> %s",
+		time.Now().Format("2006-01-02 15:04:05"), clientAddr, targetAddr)
+
+	// Настроить соединения
+	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
+		tcpConn.SetReadBuffer(1024 * 1024)
+		tcpConn.SetWriteBuffer(1024 * 1024)
+		tcpConn.SetNoDelay(true)
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(60 * time.Second)
+	}
+	if tcpConn, ok := serverConn.(*net.TCPConn); ok {
+		tcpConn.SetReadBuffer(1024 * 1024)
+		tcpConn.SetWriteBuffer(1024 * 1024)
+		tcpConn.SetNoDelay(true)
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(60 * time.Second)
+	}
+
+	done := make(chan int64, 2)
+	readTimeout := 300 * time.Second
+	idleTimeout := time.Duration(p.config.IdleTimeout) * time.Second
+
+	go func() {
+		bytes := copyData(serverConn, clientConn, readTimeout, idleTimeout)
+		done <- bytes
+	}()
+
+	go func() {
+		bytes := copyData(clientConn, serverConn, readTimeout, idleTimeout)
+		done <- bytes
+	}()
+
+	<-done
+	<-done
+}
+
 // handleConnection обрабатывает подключение клиента
 func (p *SNIProxy) handleConnection(clientConn net.Conn, listenPort int) {
 	clientAddr := clientConn.RemoteAddr().String()
 	defer clientConn.Close()
+
+	// Для игровых портов без TLS (например, Supercell на 9339) делаем прозрачный TCP-прокси
+	if listenPort == 9339 || listenPort == 30000 {
+		p.handleRawConnection(clientConn, listenPort)
+		return
+	}
 
 	// Извлечь SNI
 	sni, headerBuf, err := extractSNIWithBuffer(clientConn)
@@ -490,15 +573,32 @@ func (p *SNIProxy) setupUDPForward() error {
 	targetIP := targetParts[0]
 	targetPort := targetParts[1]
 
-	// Найти IP через DNS для Supercell
-	ips, err := p.resolver.Resolve("game.brawlstarsgame.com")
-	if err == nil && len(ips) > 0 {
-		targetIP = ips[0].String()
-		p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:9339 (Brawl Stars)",
-			time.Now().Format("2006-01-02 15:04:05"), targetIP)
+	// Проверить конфиг на наличие явно заданного IP для порта 9339
+	for _, g := range p.config.Games {
+		if g.Port == 9339 && g.TargetIP != "" {
+			targetIP = g.TargetIP
+			if g.TargetPort > 0 {
+				targetPort = fmt.Sprintf("%d", g.TargetPort)
+			}
+			break
+		}
+	}
+
+	// Найти IP через DNS для Supercell (только если не задан жестко или для подстраховки)
+	// Но лучше использовать заданный в конфиге, если он есть.
+	if targetIP == "" || targetIP == targetParts[0] {
+		ips, err := p.resolver.Resolve("game.brawlstarsgame.com")
+		if err == nil && len(ips) > 0 {
+			targetIP = ips[0].String()
+			p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:%s (Brawl Stars DNS)",
+				time.Now().Format("2006-01-02 15:04:05"), targetIP, targetPort)
+		} else {
+			p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:%s",
+				time.Now().Format("2006-01-02 15:04:05"), targetIP, targetPort)
+		}
 	} else {
-		p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:9339",
-			time.Now().Format("2006-01-02 15:04:05"), targetIP)
+		p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:%s (Config IP)",
+			time.Now().Format("2006-01-02 15:04:05"), targetIP, targetPort)
 	}
 
 	// Настроить iptables для UDP
