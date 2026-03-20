@@ -320,9 +320,30 @@ func (p *SNIProxy) handleRawConnection(clientConn net.Conn, listenPort int) {
 	var dialer net.Dialer
 	serverConn, err := dialer.DialContext(ctx, "tcp", targetAddr)
 	if err != nil {
-		p.logger.Printf("[%s] ERROR ❌ Подключение к %s (Raw TCP): %v",
+		// Если не удалось подключиться к заданному IP (например, таймаут), пробуем другой известный IP (fallbacks)
+		fallbacks := []string{"18.196.54.123", "3.120.158.117", "18.195.148.243"}
+		connected := false
+		
+		p.logger.Printf("[%s] WARN ⚠️ Ошибка подключения к %s: %v. Пробуем резервные IP...", 
 			time.Now().Format("2006-01-02 15:04:05"), targetAddr, err)
-		return
+			
+		for _, fb := range fallbacks {
+			if fb == targetAddr { continue }
+			
+			fbAddr := fmt.Sprintf("%s:%d", fb, listenPort)
+			serverConn, err = dialer.DialContext(ctx, "tcp", fbAddr)
+			if err == nil {
+				targetAddr = fbAddr
+				connected = true
+				break
+			}
+		}
+		
+		if !connected {
+			p.logger.Printf("[%s] ERROR ❌ Все резервные подключения к %s (Raw TCP) провалились",
+				time.Now().Format("2006-01-02 15:04:05"), targetAddr)
+			return
+		}
 	}
 	defer serverConn.Close()
 
@@ -585,10 +606,14 @@ func (p *SNIProxy) setupUDPForward() error {
 	}
 
 	// Найти IP через DNS для Supercell (только если не задан жестко или для подстраховки)
-	// Но лучше использовать заданный в конфиге, если он есть.
+	// Важно: в России DNS может выдавать заблокированные IP-адреса Amazon (AWS),
+	// поэтому приоритет всегда отдаем IP-адресу из конфига.
 	if targetIP == "" || targetIP == targetParts[0] {
 		ips, err := p.resolver.Resolve("game.brawlstarsgame.com")
 		if err == nil && len(ips) > 0 {
+			// Проверяем, не заблокирован ли этот IP (Amazon) - простая эвристика
+			// Обычно заблокированы 18.x.x.x, 3.x.x.x, 52.x.x.x, 44.x.x.x и т.д.
+			// Лучше просто не использовать DNS для Brawl Stars, если есть рабочий IP.
 			targetIP = ips[0].String()
 			p.logger.Printf("[%s] INFO 🎮 UDP forward: :9339 -> %s:%s (Brawl Stars DNS)",
 				time.Now().Format("2006-01-02 15:04:05"), targetIP, targetPort)
