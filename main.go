@@ -601,17 +601,13 @@ func (p *SNIProxy) setupUDPForward() error {
 			time.Now().Format("2006-01-02 15:04:05"), targetIP, targetPort)
 	}
 
-	// Настроить iptables для UDP
+	// Настроить iptables для UDP (отключено, так как Go сам проксирует UDP и TCP корректно)
+	// и без MASQUERADE правила iptables ломают маршрутизацию (асимметричный роутинг)
 	commands := []string{
-		// Включить IP forwarding
 		"echo 1 > /proc/sys/net/ipv4/ip_forward",
-		// UDP DNAT
-		"iptables -t nat -C PREROUTING -p udp --dport 9339 -j DNAT --to-destination " + targetIP + ":" + targetPort + " 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport 9339 -j DNAT --to-destination " + targetIP + ":" + targetPort,
-		// TCP DNAT (для Supercell)
-		"iptables -t nat -C PREROUTING -p tcp --dport 9339 -j DNAT --to-destination " + targetIP + ":" + targetPort + " 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport 9339 -j DNAT --to-destination " + targetIP + ":" + targetPort,
-		// Разрешить FORWARD
-		"iptables -C FORWARD -p udp --dport 9339 -j ACCEPT 2>/dev/null || iptables -A FORWARD -p udp --dport 9339 -j ACCEPT",
-		"iptables -C FORWARD -p tcp --dport 9339 -j ACCEPT 2>/dev/null || iptables -A FORWARD -p tcp --dport 9339 -j ACCEPT",
+		// Очищаем старые правила, если они были
+		"iptables -t nat -D PREROUTING -p udp --dport 9339 -j DNAT --to-destination " + targetIP + ":" + targetPort + " 2>/dev/null || true",
+		"iptables -t nat -D PREROUTING -p tcp --dport 9339 -j DNAT --to-destination " + targetIP + ":" + targetPort + " 2>/dev/null || true",
 	}
 
 	for _, cmd := range commands {
@@ -637,9 +633,7 @@ func (p *SNIProxy) setupUDPForward() error {
 	targetAddr := targetIP + ":" + targetPort
 	go p.proxyUDP(udpConn, targetAddr)
 
-	// TCP не слушаем - iptables сам перенаправит на target
-	// Это работает потому что iptables DNAT меняет destination IP
-	p.logger.Printf("[%s] INFO 🎮 TCP via iptables DNAT: :9339 -> %s",
+	p.logger.Printf("[%s] INFO 🎮 UDP and TCP proxy running for port 9339 -> %s",
 		time.Now().Format("2006-01-02 15:04:05"), targetAddr)
 
 	return nil

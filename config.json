@@ -2,14 +2,22 @@
   "listen_ports": [80, 443, 9339, 30000],
   "games": [
     {
-      "name": "Supercell Games",
+      "name": "Supercell Games (TCP/UDP)",
       "domains": [
         "game.clashroyaleapp.com",
         "gamea.clashofclans.com",
         "game.clashofclans.com",
         "game.brawlstarsgame.com",
         "game.squadbustersgame.com",
-        "game.mocogame.com",
+        "game.mocogame.com"
+      ],
+      "port": 9339,
+      "target_port": 9339,
+      "target_ip": "18.196.54.123"
+    },
+    {
+      "name": "Supercell Games (HTTPS)",
+      "domains": [
         "game-assets.clashroyaleapp.com",
         "game-assets.clashofclans.com",
         "game-assets.brawlstarsgame.com",
@@ -19,9 +27,8 @@
         "accounts.supercell.com",
         "store.supercell.com"
       ],
-      "port": 9339,
-      "target_port": 9339,
-      "target_ip": "18.196.54.123"
+      "port": 443,
+      "target_port": 443
     },
     {
       "name": "ChatGPT / OpenAI",
