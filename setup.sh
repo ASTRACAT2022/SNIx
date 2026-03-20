@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# SNI Proxy Auto-Setup Script с выбором игр
+# SNI Proxy Auto-Setup Script
 # Запускать от root: sudo ./setup.sh
 
 set -e
@@ -16,158 +16,82 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# Получить внешний IP
-EXTERNAL_IP=$(curl -s ifconfig.me 2>/dev/null || echo "Не удалось определить")
-echo -e "${YELLOW}Внешний IP: $EXTERNAL_IP${NC}"
+# Получить IPv4
+IPv4=$(curl -s -4 ifconfig.me 2>/dev/null || echo "")
+if [ -z "$IPv4" ]; then
+    IPv4=$(curl -s -4 ipinfo.io/ip 2>/dev/null || echo "Не удалось определить")
+fi
+echo -e "${YELLOW}Внешний IPv4: $IPv4${NC}"
+
+# Если есть IPv6 тоже покажем
+IPv6=$(curl -s -6 ifconfig.me 2>/dev/null || echo "")
+if [ -n "$IPv6" ]; then
+    echo -e "${YELLOW}Внешний IPv6: $IPv6${NC}"
+fi
 echo ""
 
-# ========== ВЫБОР ИГР ==========
-echo -e "${BLUE}🎮 ВЫБЕРИТЕ ИГРЫ ДЛЯ ПРОКСИРОВАНИЯ:${NC}"
-echo "   (можно выбрать несколько через пробел, например: 1 2 3)"
+# ========== ВОПРОСЫ ==========
+
+# mo.co
+echo "Нужен ли прокси для игры mo.co (Squad Busters)? [y/n]"
+read moco_choice
 echo ""
-echo "   1) Brawl Stars      (порт 9339)"
-echo "   2) Clash Royale     (порт 9340)"
-echo "   3) Clash of Clans   (порт 9341)"
-echo "   4) Squad Busters    (порт 30000)"
+
+# Supercell
+echo "Нужен ли прокси для одной из игр Supercell?"
+echo "Все Supercell игры, кроме mo.co, используют порт 9339."
+echo "На одном сервере может быть только ОДИН прокси для Supercell игр."
 echo ""
-read -p "   Ваш выбор (по умолчанию: 1): " -r
-GAME_CHOICE="${REPLY:-1}"
+echo "1. Не нужен"
+echo "2. Clash Royale"
+echo "3. Clash of Clans"
+echo "4. Brawl Stars"
+echo "5. Squad Busters (но mo.co это уже выше)"
+echo "[1-5]:"
+read supercell_choice
+echo ""
 
 # Парсим выбор
-BRAWL_SELECTED=0
-ROYALE_SELECTED=0
-COC_SELECTED=0
-SQUAD_SELECTED=0
+GAME_SELECTED=""
+GAME_DOMAIN=""
+GAME_PORT=""
 
-for choice in $GAME_CHOICE; do
-    case $choice in
-        1) BRAWL_SELECTED=1 ;;
-        2) ROYALE_SELECTED=1 ;;
-        3) COC_SELECTED=1 ;;
-        4) SQUAD_SELECTED=1 ;;
-    esac
-done
+case "$supercell_choice" in
+    2)
+        GAME_SELECTED="Clash Royale"
+        GAME_DOMAIN="game.clashroyaleapp.com"
+        GAME_PORT="9339"
+        ;;
+    3)
+        GAME_SELECTED="Clash of Clans"
+        GAME_DOMAIN="gamea.clashofclans.com"
+        GAME_PORT="9339"
+        ;;
+    4)
+        GAME_SELECTED="Brawl Stars"
+        GAME_DOMAIN="game.brawlstarsgame.com"
+        GAME_PORT="9339"
+        ;;
+    5)
+        GAME_SELECTED="Squad Busters"
+        GAME_DOMAIN="game.squadbustersgame.com"
+        GAME_PORT="9339"
+        ;;
+    *)
+        GAME_SELECTED=""
+        ;;
+esac
 
-# Если ничего не выбрано - ставим Brawl Stars по умолчанию
-if [[ $BRAWL_SELECTED -eq 0 && $ROYALE_SELECTED -eq 0 && $COC_SELECTED -eq 0 && $SQUAD_SELECTED -eq 0 ]]; then
-    BRAWL_SELECTED=1
+# Проверяем что что-то выбрано
+if [[ ! "$moco_choice" =~ ^[yY]$ ]] && [ -z "$GAME_SELECTED" ]; then
+    echo -e "${RED}❌ Вы ничего не выбрали! Прокси не запущен.${NC}"
+    exit 0
 fi
 
+echo -e "${GREEN}✅ Выбрано:${NC}"
+[[ "$moco_choice" =~ ^[yY]$ ]] && echo "   - mo.co / Squad Busters (порт 30000)"
+[ -n "$GAME_SELECTED" ] && echo "   - $GAME_SELECTED (порт $GAME_PORT)"
 echo ""
-echo -e "${GREEN}✅ Выбраны игры:${NC}"
-[[ $BRAWL_SELECTED -eq 1 ]] && echo "   - Brawl Stars (9339)"
-[[ $ROYALE_SELECTED -eq 1 ]] && echo "   - Clash Royale (9340)"
-[[ $COC_SELECTED -eq 1 ]] && echo "   - Clash of Clans (9341)"
-[[ $SQUAD_SELECTED -eq 1 ]] && echo "   - Squad Busters (30000)"
-echo ""
-
-# ========== ОБНОВЛЕНИЕ КОДА ==========
-echo "📥 Обновление из GitHub..."
-git pull 2>/dev/null || echo -e "${YELLOW}⚠️ Git pull не выполнен (не репозиторий или нет изменений)${NC}"
-
-# ========== КОМПИЛЯЦИЯ ==========
-echo "🔨 Компиляция..."
-go build -o proxy -ldflags="-s -w" main.go
-if [ $? -ne 0 ]; then
-    echo -e "${RED}❌ Ошибка компиляции!${NC}"
-    exit 1
-fi
-
-# ========== КОНФИГУРАЦИЯ PORTS В CONFIG.JSON ==========
-echo "⚙️ Обновление config.json..."
-
-# Определяем какие порты слушать
-LISTEN_PORTS="[80, 443"
-GAME_PORTS_TCP=""
-
-[[ $BRAWL_SELECTED -eq 1 ]] && GAME_PORTS_TCP="${GAME_PORTS_TCP}9339, "
-[[ $ROYALE_SELECTED -eq 1 ]] && GAME_PORTS_TCP="${GAME_PORTS_TCP}9340, "
-[[ $COC_SELECTED -eq 1 ]] && GAME_PORTS_TCP="${GAME_PORTS_TCP}9341, "
-[[ $SQUAD_SELECTED -eq 1 ]] && GAME_PORTS_TCP="${GAME_PORTS_TCP}30000, "
-
-# Убираем последнюю запятую и пробел
-GAME_PORTS_TCP="${GAME_PORTS_TCP%, }"
-
-# Обновляем listen_ports в config.json
-if grep -q '"listen_ports"' config.json; then
-    sed -i "s/\"listen_ports\": \[.*\]/\"listen_ports\": [80, 443, ${GAME_PORTS_TCP}]/" config.json
-fi
-
-# ========== ОБНОВЛЕНИЕ main.go ДЛЯ ДИНАМИЧЕСКИХ ПОРТОВ ==========
-echo "⚙️ Обновление main.go..."
-
-# Создаем новый файл start.go с динамическими портами
-cat > start_games.go << 'GAMESEOF'
-// +build ignore
-
-package main
-
-import (
-	"fmt"
-	"net"
-	"sync"
-	"time"
-)
-
-var gamePortConfigs = []struct {
-	ListenPort int
-	Domain     string
-	TargetPort int
-}{
-	{9339, "game.brawlstarsgame.com", 9339},
-	{9340, "game.clashroyaleapp.com", 9339},
-	{9341, "gamea.clashofclans.com", 9339},
-	{30000, "game.mocogame.com", 30000},
-}
-
-func startGameListeners(proxy *SNIProxy) {
-	var wg sync.WaitGroup
-
-	for _, game := range gamePortConfigs {
-		wg.Add(1)
-		go func(g struct {
-			ListenPort int
-			Domain     string
-			TargetPort int
-		}) {
-			defer wg.Done()
-			addr := fmt.Sprintf(":%d", g.ListenPort)
-			listener, err := net.Listen("tcp", addr)
-			if err != nil {
-				proxy.logger.Printf("[%s] ERROR ❌ Game port %d: %v",
-					time.Now().Format("2006-01-02 15:04:05"), g.ListenPort, err)
-				return
-			}
-			defer listener.Close()
-
-			proxy.logger.Printf("[%s] INFO 🚀 Listening on port %d (-> %s)",
-				time.Now().Format("2006-01-02 15:04:05"), g.ListenPort, g.Domain)
-
-			for {
-				conn, err := listener.Accept()
-				if err != nil {
-					continue
-				}
-				go proxy.handleGameConnection(conn, g.ListenPort, g.Domain, g.TargetPort)
-			}
-		}(game)
-	}
-
-	wg.Wait()
-}
-GAMESEOF
-
-# ========== ЗАМЕНА handleRawConnection НА ДИНАМИЧЕСКУЮ ВЕРСИЮ ==========
-# Нам нужно обновить handleRawConnection чтобы она поддерживала новые порты
-
-# Резервная копия
-cp main.go main.go.bak
-
-# Обновляем маршрутизацию в main.go
-# Ищем функцию handleRawConnection и заменяем логику маршрутизации
-
-# Удаляем start_games.go если есть
-rm -f start_games.go
 
 # ========== ОСТАНОВКА СТАРЫХ ПРОЦЕССОВ ==========
 echo "📋 Остановка старых процессов..."
@@ -183,6 +107,79 @@ iptables -F FORWARD 2>/dev/null || true
 # Включить IP forwarding
 echo "📡 Включение IP forwarding..."
 echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+
+# ========== ОБНОВЛЕНИЕ КОДА ==========
+echo "📥 Обновление из GitHub..."
+git pull 2>/dev/null || echo -e "${YELLOW}⚠️ Git pull пропущен${NC}"
+
+# ========== КОМПИЛЯЦИЯ ==========
+echo "🔨 Компиляция..."
+go build -o proxy -ldflags="-s -w" main.go
+if [ $? -ne 0 ]; then
+    echo -e "${RED}❌ Ошибка компиляции!${NC}"
+    exit 1
+fi
+
+# ========== ОБНОВЛЕНИЕ CONFIG.JSON ==========
+echo "⚙️ Обновление config.json..."
+
+# Определяем какие порты слушать
+# Всегда слушаем 80 и 443
+# Добавляем игровые порты
+GAME_PORTS=""
+[[ "$moco_choice" =~ ^[yY]$ ]] && GAME_PORTS="${GAME_PORTS}30000, "
+[ -n "$GAME_PORT" ] && GAME_PORTS="${GAME_PORTS}${GAME_PORT}, "
+
+# Убираем последнюю запятую
+GAME_PORTS="${GAME_PORTS%, }"
+
+# Обновляем listen_ports в config.json
+if grep -q '"listen_ports"' config.json; then
+    sed -i "s/\"listen_ports\": \[.*\]/\"listen_ports\": [80, 443, ${GAME_PORTS}]/" config.json
+fi
+
+# ========== ОБНОВЛЕНИЕ main.go ==========
+echo "⚙️ Обновление main.go..."
+
+# Резервная копия
+cp main.go main.go.bak 2>/dev/null || true
+
+# Обновляем маршрутизацию в main.go для порта 9339
+if [ -n "$GAME_DOMAIN" ]; then
+    # Меняем домен для порта 9339 в зависимости от выбора
+    case "$supercell_choice" in
+        2)
+            sed -i 's/targetDomain = "game.brawlstarsgame.com"/targetDomain = "game.clashroyaleapp.com"/' main.go
+            ;;
+        3)
+            sed -i 's/targetDomain = "game.brawlstarsgame.com"/targetDomain = "gamea.clashofclans.com"/' main.go
+            ;;
+        4)
+            # По умолчанию и так Brawl Stars
+            ;;
+        5)
+            sed -i 's/targetDomain = "game.brawlstarsgame.com"/targetDomain = "game.squadbustersgame.com"/' main.go
+            ;;
+    esac
+    echo "   Порт 9339 -> $GAME_DOMAIN"
+fi
+
+if [[ "$moco_choice" =~ ^[yY]$ ]]; then
+    echo "   Порт 30000 -> game.mocogame.com"
+fi
+
+# Перекомпилируем
+echo "🔨 Перекомпиляция с новыми настройками..."
+go build -o proxy -ldflags="-s -w" main.go
+if [ $? -ne 0 ]; then
+    echo -e "${RED}❌ Ошибка компиляции после обновления!${NC}"
+    echo "Восстанавливаем оригинальный main.go..."
+    mv main.go.bak main.go 2>/dev/null || true
+    exit 1
+fi
+
+# Удаляем резервную копию
+rm -f main.go.bak
 
 # ========== SYSTEMD СЕРВИС ==========
 echo "⚙️ Настройка systemd службы..."
@@ -245,11 +242,13 @@ echo ""
 echo "========================"
 echo -e "${GREEN}✅ Установка завершена!${NC}"
 echo ""
-echo -e "${BLUE}📱 Для подключения игр:${NC}"
-[[ $BRAWL_SELECTED -eq 1 ]] && echo "   Brawl Stars -> DNS: $EXTERNAL_IP"
-[[ $ROYALE_SELECTED -eq 1 ]] && echo "   Clash Royale -> DNS: $EXTERNAL_IP (порт 9340 в разработке)"
-[[ $COC_SELECTED -eq 1 ]] && echo "   Clash of Clans -> DNS: $EXTERNAL_IP (порт 9341 в разработке)"
-[[ $SQUAD_SELECTED -eq 1 ]] && echo "   Squad Busters -> DNS: $EXTERNAL_IP"
+echo -e "${BLUE}📱 Для подключения:${NC}"
+
+if [ -n "$IPv4" ] && [ "$IPv4" != "Не удалось определить" ]; then
+    [[ "$moco_choice" =~ ^[yY]$ ]] && echo "   mo.co -> DNS: $IPv4 (порт 30000)"
+    [ -n "$GAME_SELECTED" ] && echo "   $GAME_SELECTED -> DNS: $IPv4 (порт $GAME_PORT)"
+fi
+
 echo ""
 echo "📊 Мониторинг:"
 echo "   journalctl -u sni-proxy -f"
